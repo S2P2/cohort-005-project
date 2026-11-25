@@ -1,0 +1,18 @@
+{
+  "run_root": "/var/lib/factory/runs",
+  "incus": "/usr/bin/incus",
+  "incus_project": "factory",
+  "incus_profile": "trial",
+  "incus_network": "factory-trial",
+  "image_fingerprint": "REPLACE_WITH_FULL_LOCAL_VM_IMAGE_FINGERPRINT",
+  "issuer": "/opt/factory/issue-magpie-key",
+  "magpie_url": "https://magpie.factory.example/v1",
+  "magpie_model": "openai/REPLACE_WITH_SCOPED_MODEL",
+  "blocked_endpoints": [["192.0.2.10", 22], ["192.0.2.10", 8443]],
+  "agent_timeout_seconds": 300,
+  "repositories": {
+    "factory-trials/smoke": {
+      "url": "https://forgejo.factory.example/factory-trials/smoke.git"
+    }
+  }
+}

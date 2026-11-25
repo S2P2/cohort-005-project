@@ -1,0 +1,14 @@
+skip_clone: true
+
+labels:
+  backend: local
+  factory: trial
+
+when:
+  - event: manual
+    branch: main
+    evaluate: 'CI_REPO == "factory-control/launcher"'
+
+steps:
+  - name: isolated-trial
+    image: /opt/factory/woodpecker-entrypoint.py

@@ -100,23 +100,6 @@ elif command == "exec":
         print("f" * 40 if case == "wrong-ref" else payload["commit"])
     elif action == "agent":
         assert payload["key"] == "fixture-secret"
-        if case == "provider-error-with-marker":
-            executable = root / "codex"
-            executable.write_text(
-                f"#!{sys.executable}\n"
-                "from pathlib import Path\n"
-                "import sys\n"
-                'Path(sys.argv[sys.argv.index("--output-last-message") + 1]).write_text("FACTORY_TRIAL_OK")\n'
-                'print("Provider unavailable")\n'
-                "sys.exit(42)\n"
-            )
-            executable.chmod(0o700)
-            guest_home = root / "guest-home"
-            (guest_home / "repo").mkdir(parents=True)
-            guest = rest[-1].replace('Path("/home/factory")', f"Path({str(guest_home)!r})")
-            guest = guest.replace('"/usr/local/bin/codex"', repr(str(executable)))
-            sys.exit(subprocess.run([sys.executable, "-I", "-c", guest],
-                                    input=json.dumps(payload), text=True).returncode)
         if case in {"agent-timeout", "revoke-unavailable", "agent-interrupt"}:
             print("started agent", flush=True)
             deadline = time.monotonic() + 5
@@ -124,7 +107,28 @@ elif command == "exec":
                 time.sleep(0.01)
             if not vm.exists():
                 sys.exit(4)
-        print("FACTORY_TRIAL_OK")
+        executable = root / "codex"
+        marker = "" if case == "missing-marker" else "FACTORY_TRIAL_OK"
+        provider_failure = case == "provider-error-with-marker"
+        executable.write_text(
+            f"#!{sys.executable}\n"
+            "from pathlib import Path\n"
+            "import os\n"
+            "import sys\n"
+            'message = Path(sys.argv[sys.argv.index("--output-last-message") + 1])\n'
+            f"if {bool(marker)}:\n"
+            f"    message.write_text({marker!r})\n"
+            f'print({"Provider unavailable" if provider_failure else marker or "No response marker"!r})\n'
+            'print(os.environ["FACTORY_MAGPIE_KEY"], file=sys.stderr)\n'
+            f"sys.exit({42 if provider_failure else 0})\n"
+        )
+        executable.chmod(0o700)
+        guest_home = root / "guest-home"
+        (guest_home / "repo").mkdir(parents=True, exist_ok=True)
+        guest = rest[-1].replace('Path("/home/factory")', f"Path({str(guest_home)!r})")
+        guest = guest.replace('"/usr/local/bin/codex"', repr(str(executable)))
+        sys.exit(subprocess.run([sys.executable, "-I", "-c", guest],
+                                input=json.dumps(payload), text=True).returncode)
     else:
         sys.exit(2)
 elif command == "delete":

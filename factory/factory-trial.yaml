@@ -7,4 +7,4 @@ params:
 
 steps:
   - name: isolated-trial
-    run: exec /opt/factory/dagu-entrypoint.py
+    run: exec /opt/factory/scheduler-entrypoint.py dagu

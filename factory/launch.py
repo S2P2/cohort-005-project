@@ -76,12 +76,12 @@ def trial_inputs(config, request):
     return repository, required
 
 
-def process(args, timeout=30, payload=None, output=None, lease=(), stop=None):
+def process(args, timeout=30, payload=None, output=None, lease=(), stop=None, capture_stderr=False):
     data = json.dumps(payload).encode() if payload is not None else b""
     deadline = time.monotonic() + timeout
     with subprocess.Popen(args, stdin=subprocess.PIPE, pass_fds=lease,
                           stdout=output if output is not None else subprocess.PIPE,
-                          stderr=output if output is not None else subprocess.DEVNULL) as child:
+                          stderr=subprocess.PIPE if capture_stderr else subprocess.DEVNULL) as child:
         try:
             while True:
                 if stop is not None:
@@ -252,7 +252,7 @@ class Run:
             "--user=1000", "--group=1000",
             "--cwd=/home/factory", "--", "/usr/bin/python3", "-I", "-c", GUEST.read_text(),
             timeout=timeout, payload={"action": action, **payload}, output=output,
-            stop=self.check_stop, keep_lease=False,
+            stop=self.check_stop, keep_lease=False, capture_stderr=action == "agent",
         )
 
     def execute(self, repository, required):
@@ -296,8 +296,16 @@ class Run:
                 raise TrialError("Guest agent timed out.") from None
             finally:
                 os.fsync(log.fileno())
-        self.save(agent_exit_status=result.returncode, output_complete=True)
-        checked(result, "Guest agent")
+        checked(result, "Guest agent transport")
+        try:
+            completion = json.loads(result.stderr)
+            status, valid = completion["exit_status"], completion["marker_valid"]
+            require(type(status) is int and type(valid) is bool, "Invalid guest agent completion.")
+        except (ValueError, KeyError, TypeError):
+            raise TrialError("Invalid guest agent completion.") from None
+        self.save(agent_exit_status=status, output_complete=True)
+        require(status == 0, f"Codex CLI failed (exit {status}).")
+        require(valid, "The model response did not match the trial marker.")
 
     def cleanup_vm(self):
         if not self.record["allocation_attempted"] or self.record["vm_cleanup"] == "removed":

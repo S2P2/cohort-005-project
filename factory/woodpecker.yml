@@ -13,4 +13,4 @@ steps:
   - name: isolated-trial
     image: /bin/sh
     commands:
-      - exec /opt/factory/woodpecker-entrypoint.py
+      - exec /opt/factory/scheduler-entrypoint.py woodpecker

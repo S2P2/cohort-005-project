@@ -14,6 +14,47 @@ LAUNCHER = Path(__file__).resolve().parents[1] / "launch.py"
 COMMIT = "1234567890abcdef" * 2 + "12345678"
 
 
+class SchedulerEntrypointTest(unittest.TestCase):
+    def test_isolated_entrypoint_checks_both_scheduler_identities(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            launcher = root / "launch.py"
+            launcher.write_text("import json, os, sys\nprint(json.dumps([sys.argv[1:], dict(os.environ)]))\n")
+            entrypoint = LAUNCHER.with_name("scheduler-entrypoint.py")
+            staged = root / entrypoint.name
+            staged.write_text(entrypoint.read_text().replace("/opt/factory/launch.py", str(launcher)))
+            staged.chmod(0o700)
+            shared = {
+                "FACTORY_RUN_ID": "trial-1", "FACTORY_REPO": "demo/trial",
+                "FACTORY_ISSUE": "demo/trial#1", "FACTORY_COMMIT": COMMIT,
+                "PYTHONPATH": str(root), "SCHEDULER_SECRET": "fixture-secret",
+            }
+            identities = {
+                "woodpecker": {
+                    "CI_PIPELINE_EVENT": "manual", "CI_REPO": "factory-control/launcher",
+                    "CI_COMMIT_BRANCH": "main", "CI_PIPELINE_NUMBER": "7",
+                },
+                "dagu": {"DAG_RUN_ID": "trial-1"},
+            }
+            for scheduler, job in (("woodpecker", "woodpecker:factory-control/launcher:7"),
+                                   ("dagu", "dagu:factory-trial:trial-1")):
+                with self.subTest(scheduler=scheduler):
+                    command = [str(staged), scheduler]
+                    rejected = subprocess.run(command, cwd=root, env=shared, capture_output=True, timeout=5)
+                    self.assertNotEqual(rejected.returncode, 0)
+                    self.assertEqual(rejected.stdout, b"")
+                    accepted = subprocess.run(command, cwd=root, env={**shared, **identities[scheduler]},
+                                              capture_output=True, timeout=5)
+                    self.assertEqual(accepted.returncode, 0, accepted.stderr)
+                    args, env = json.loads(accepted.stdout)
+                    self.assertEqual(args, [
+                        "--config", "/etc/factory/trial.json", f"--job={job}", "--run-id=trial-1",
+                        "--repo=demo/trial", "--issue=demo/trial#1", f"--commit={COMMIT}",
+                        "--startup=unspecified",
+                    ])
+                    self.assertEqual(set(env), {"HOME", "PATH", "LANG"})
+
+
 def configure_trial(root):
     config = root / "config.json"
     runs = root / "runs"
@@ -187,6 +228,21 @@ class TrialTest(unittest.TestCase):
         self.assertIn("Provider unavailable", (self.runs / "trial-1" / "agent.log").read_text())
         self.assertFalse((self.root / "key").exists())
         self.assertFalse((self.root / "vm.json").exists())
+
+    def test_missing_marker_fails_trial_but_preserves_zero_codex_exit_code(self):
+        result = self.launch(FACTORY_CASE="missing-marker")
+        self.assertEqual(result.returncode, 1)
+        record = self.record()
+        self.assertEqual(record["state"], "failed")
+        self.assertEqual(record["agent_exit_status"], 0)
+        self.assertTrue(record["output_complete"])
+        self.assertIn("did not match the trial marker", record["error"])
+        self.assertEqual(record["vm_cleanup"], "removed")
+        self.assertEqual(record["magpie_cleanup"], "revoked")
+        log = (self.runs / "trial-1" / "agent.log").read_text()
+        self.assertIn("No response marker", log)
+        self.assertIn("[redacted]", log)
+        self.assertNotIn("fixture-secret", log + result.stdout + result.stderr + json.dumps(record))
 
     def test_records_trial_and_removes_vm_and_magpie_key(self):
         result = self.launch()

@@ -243,9 +243,8 @@ class Dagu:
     def find(self, run_id):
         return self.job(run_id) if self.details(run_id) is not None else None
 
-    def cancel(self, run_id):
+    def cancel(self, run_id, details):
         terminal = {"aborted", "failed", "partially_succeeded", "rejected", "succeeded"}
-        details = self.details(run_id)
         if details is None or details["statusLabel"] in terminal:
             return True
         status = details["statusLabel"]
@@ -281,6 +280,7 @@ def seed(settings):
             CREATE TABLE IF NOT EXISTS baseline (scope TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS issue_labels (
                 repo TEXT NOT NULL, issue INTEGER NOT NULL, applied INTEGER NOT NULL,
+                opening_covered INTEGER NOT NULL DEFAULT 1,
                 PRIMARY KEY (repo, issue)
             );
             CREATE TABLE IF NOT EXISTS deliveries (
@@ -300,7 +300,7 @@ def seed(settings):
         for repo in sorted(settings.repositories):
             for issue in settings.forgejo.issues(repo):
                 number = issue_number(issue)
-                db.execute("INSERT INTO issue_labels VALUES (?, ?, ?)",
+                db.execute("INSERT INTO issue_labels (repo, issue, applied) VALUES (?, ?, ?)",
                            (repo, number, label_applied(issue["labels"], settings.label)))
         db.execute("INSERT INTO baseline VALUES (?)", (scope(settings),))
 
@@ -331,23 +331,33 @@ def label_applied(labels, label):
     return label in {item["name"] for item in labels}
 
 
-def ingest(settings, delivery, digest, repo, number, event_type):
+def ingest(settings, delivery, digest, event, event_type):
+    repo, number = event.repo, event.number
     with ledger(settings) as db:
         db.execute("BEGIN IMMEDIATE")
         prior = db.execute("SELECT digest FROM deliveries WHERE delivery = ?", (delivery,)).fetchone()
         if prior is not None:
             return 202 if prior["digest"] == digest else 409
-        applied = label_applied(settings.forgejo.labels(repo, number), settings.label)
-        prior = db.execute("SELECT applied FROM issue_labels WHERE repo = ? AND issue = ?",
+        prior = db.execute("SELECT applied, opening_covered FROM issue_labels WHERE repo = ? AND issue = ?",
                            (repo, number)).fetchone()
         db.execute("INSERT INTO deliveries (delivery, digest, repo, issue, event_type) VALUES (?, ?, ?, ?, ?)",
                    (delivery, digest, repo, number, event_type))
-        if applied and not (prior and prior["applied"]):
+        if event.action == "opened" and prior is not None:
+            trigger = event.opened_with_trigger and not prior["opening_covered"]
+            db.execute("UPDATE issue_labels SET opening_covered = 1 WHERE repo = ? AND issue = ?",
+                       (repo, number))
+        else:
+            applied = label_applied(settings.forgejo.labels(repo, number), settings.label)
+            trigger = event.opened_with_trigger or (applied and not (prior and prior["applied"]))
+            db.execute(
+                "INSERT INTO issue_labels (repo, issue, applied, opening_covered) VALUES (?, ?, ?, ?) "
+                "ON CONFLICT (repo, issue) DO UPDATE SET applied = excluded.applied",
+                (repo, number, applied, event.action == "opened" or applied),
+            )
+        if trigger:
             commit = settings.forgejo.commit(repo, settings.repositories[repo])
             db.execute("INSERT INTO runs (run_id, repo, issue, commit_sha, delivery) VALUES (?, ?, ?, ?, ?)",
                        (f"forgejo-{uuid4().hex}", repo, f"{repo}#{number}", commit, delivery))
-        db.execute("INSERT INTO issue_labels VALUES (?, ?, ?) ON CONFLICT (repo, issue) DO UPDATE "
-                   "SET applied = excluded.applied", (repo, number, applied))
         return 202
 
 
@@ -363,9 +373,10 @@ class IssueEvent:
     number: int
     action: str
     pull_request: bool
+    opened_with_trigger: bool
 
     @classmethod
-    def parse(cls, body):
+    def parse(cls, body, trigger_label):
         payload = json.loads(body)
         if not isinstance(payload, dict):
             raise EventError("Expected a Forgejo issue event.")
@@ -375,12 +386,17 @@ class IssueEvent:
         name = repo.get("full_name")
         if not isinstance(name, str) or not name:
             raise EventError("Expected a repository full name.")
-        return cls(name, issue_number(issue), action, issue.get("pull_request") is not None)
+        return cls(name, issue_number(issue), action, issue.get("pull_request") is not None,
+                   action == "opened" and label_applied(issue.get("labels"), trigger_label))
 
 
 def webhook_server(settings, host, port):
     with ledger(settings) as db:
+        db.execute("BEGIN IMMEDIATE")
         check_baseline(settings, db)
+        if not any(column["name"] == "opening_covered"
+                   for column in db.execute("PRAGMA table_info(issue_labels)")):
+            db.execute("ALTER TABLE issue_labels ADD COLUMN opening_covered INTEGER NOT NULL DEFAULT 1")
 
     class Webhook(BaseHTTPRequestHandler):
         def setup(self):
@@ -416,8 +432,8 @@ def webhook_server(settings, host, port):
                 return 401
             try:
                 delivery = str(UUID(self.headers.get("X-Forgejo-Delivery", "")))
-                event = IssueEvent.parse(body)
-            except (ValueError, EventError):
+                event = IssueEvent.parse(body, settings.label)
+            except (ValueError, KeyError, TypeError, EventError):
                 return 400
             event_type = self.headers.get("X-Forgejo-Event-Type")
             if (self.headers.get("X-Forgejo-Event") != "issues" or event.pull_request
@@ -428,8 +444,7 @@ def webhook_server(settings, host, port):
             if event_type == "issue_label":
                 time.sleep(LABEL_SETTLE_SECONDS)
             try:
-                return ingest(settings, delivery, hashlib.sha256(body).hexdigest(),
-                              event.repo, event.number, event_type)
+                return ingest(settings, delivery, hashlib.sha256(body).hexdigest(), event, event_type)
             except SERVICE_ERRORS:
                 print(f"Unable to commit Forgejo delivery {delivery}.", file=sys.stderr)
                 return 503
@@ -444,11 +459,18 @@ def dispatch_lock(settings):
         yield
 
 
-def finish_cancellation(settings, run_id):
-    if not settings.orchestrator.cancel(run_id):
+def finish_cancellation(settings, run_id, dispatch_state):
+    details = settings.orchestrator.details(run_id)
+    if dispatch_state == "cancelling_unconfirmed":
+        if details is None:
+            return False
+        with ledger(settings) as db:
+            db.execute("UPDATE runs SET dispatch = 'cancelling' WHERE run_id = ?", (run_id,))
+    if not settings.orchestrator.cancel(run_id, details):
         raise EventError(f"Dagu cancellation remains pending for {run_id}.")
     with ledger(settings) as db:
         db.execute("UPDATE runs SET dispatch = 'cancelled' WHERE run_id = ?", (run_id,))
+    return True
 
 
 def cancel(settings, run_id):
@@ -460,12 +482,18 @@ def cancel(settings, run_id):
             row = db.execute("SELECT dispatch, job FROM runs WHERE run_id = ?", (run_id,)).fetchone()
             if row is None:
                 raise EventError("Unknown logical run ID.")
-            job = row["job"]
-            if row["dispatch"] == "submitting":
-                job = settings.orchestrator.job(run_id)
-            db.execute("UPDATE runs SET dispatch = 'cancelling', job = ? WHERE run_id = ?",
-                       (job, run_id))
-        finish_cancellation(settings, run_id)
+            dispatch_state = row["dispatch"]
+            if dispatch_state in {"queued", "cancelled"}:
+                db.execute("UPDATE runs SET dispatch = 'cancelled' WHERE run_id = ?", (run_id,))
+                return
+            if dispatch_state == "submitting":
+                dispatch_state = "cancelling_unconfirmed"
+            elif dispatch_state == "submitted":
+                dispatch_state = "cancelling"
+            db.execute("UPDATE runs SET dispatch = ?, job = ? WHERE run_id = ?",
+                       (dispatch_state, settings.orchestrator.job(run_id), run_id))
+        if not finish_cancellation(settings, run_id, dispatch_state):
+            raise EventError(f"Dagu enqueue remains unconfirmed for {run_id}.")
 
 
 def dispatch(settings, retry_id=None):
@@ -482,9 +510,9 @@ def dispatch(settings, retry_id=None):
                     raise EventError("Unknown logical run ID.")
                 candidates = [row] if row["dispatch"] in {"queued", "submitting"} else []
         for row in candidates:
-            if row["dispatch"] == "cancelling":
+            if row["dispatch"] in {"cancelling", "cancelling_unconfirmed"}:
                 try:
-                    finish_cancellation(settings, row["run_id"])
+                    finish_cancellation(settings, row["run_id"], row["dispatch"])
                 except UPSTREAM_ERRORS:
                     print(f"Dagu cancellation remains pending for {row['run_id']}.", file=sys.stderr)
                 continue

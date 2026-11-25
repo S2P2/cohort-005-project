@@ -102,6 +102,9 @@ class Services(BaseHTTPRequestHandler):
             return
         if self.path.endswith("/enqueue"):
             run_id = body["dagRunId"]
+            if self.server.defer_enqueue:
+                self.server.deferred_enqueue = body
+                return
             if run_id in self.server.dag_runs:
                 self.send_error(500)
                 return
@@ -139,6 +142,7 @@ class SignedEventScenarios:
         self.services.commit = COMMIT
         self.services.lose_response = False
         self.services.reject_next_submission = False
+        self.services.defer_enqueue = False
         self.service_url = self.enterContext(running(self.services))
         self.config = self.root / "events.json"
         trial = self.root / "trial.json"
@@ -265,8 +269,36 @@ class SignedEventScenarios:
         seeded = self.issue(3, "factory:run")
         self.seed_and_listen()
         self.assertEqual(self.send(seeded), 202)
+        self.assertEqual(self.send(seeded, "issues", "opened"), 202)
         self.command("dispatch", "--once")
         self.assertEqual(self.submitted_inputs(), [])
+
+    def test_delayed_labeled_creation_still_dispatches_once_after_removal(self):
+        self.seed_and_listen()
+        opened = self.issue(4, "factory:run")
+        removed = self.issue(4)
+        self.assertEqual(self.send(opened), 202)
+        self.assertEqual(json.loads(self.command("status")), [])
+        delivery = str(uuid4())
+        self.assertEqual(self.send(opened, "issues", "opened", delivery), 202)
+        self.assertEqual(self.send(opened, "issues", "opened", delivery), 202)
+        self.assertEqual(self.send(opened, "issues", "opened"), 202)
+        self.command("dispatch", "--once")
+        self.assertEqual(len(self.submitted_inputs()), 1)
+        self.issue(4, "factory:run")
+        self.assertEqual(self.send(removed), 202)
+        self.command("dispatch", "--once")
+        self.assertEqual(len(self.submitted_inputs()), 2)
+
+    def test_late_opening_coalesces_with_the_first_observed_application(self):
+        self.seed_and_listen()
+        opened = self.issue(4, "factory:run")
+        self.assertEqual(self.send(opened), 202)
+        self.issue(4)
+        self.assertEqual(self.send(opened, action="label_cleared"), 202)
+        self.assertEqual(self.send(opened, "issues", "opened"), 202)
+        self.command("dispatch", "--once")
+        self.assertEqual(len(self.submitted_inputs()), 1)
 
     def test_existing_issue_requires_an_observed_removal_before_reapplication(self):
         old_snapshot = self.issue(4)
@@ -438,6 +470,55 @@ class DaguEventsTest(SignedEventScenarios, unittest.TestCase):
         self.assertEqual(final["dispatch"], "cancelled")
         self.assertEqual(final["job"], initial["job"])
         self.assertEqual(self.services.dag_runs[run_id]["statusLabel"], "aborted")
+
+    def test_ambiguous_enqueue_remains_pending_through_404_and_dequeues_late_arrival(self):
+        self.seed_and_listen()
+        self.assertEqual(self.send(self.issue(4, "factory:run"), "issues", "opened"), 202)
+        self.services.defer_enqueue = True
+        self.command("dispatch", "--once")
+        initial, = json.loads(self.command("status"))
+        run_id = initial["run_id"]
+        self.assertEqual(initial["dispatch"], "submitting")
+        self.assertNotIn(run_id, self.services.dag_runs)
+
+        trial = configure_trial(self.root)
+        launcher = [sys.executable, str(LAUNCHER), "--config", str(trial)]
+        env = {**os.environ, "FACTORY_FIXTURE": str(self.root), "FIXTURE_RUN_ID": run_id}
+        fence = subprocess.run([*launcher, "cancel", "--run-id", run_id], env=env,
+                               capture_output=True, text=True, timeout=10)
+        self.assertEqual(fence.returncode, 0, fence.stderr)
+        self.assertNotEqual(self.invoke("cancel", "--run-id", run_id).returncode, 0)
+        self.command("dispatch", "--once")
+        pending, = json.loads(self.command("status"))
+        self.assertEqual(pending["dispatch"], "cancelling_unconfirmed")
+        self.assertEqual(pending["job"], self.job(run_id))
+        self.services.defer_enqueue = False
+        self.command("retry", "--run-id", run_id)
+        self.assertNotIn(run_id, self.services.dag_runs)
+
+        with urlopen(Request(self.service_url + "/api/v1/dags/factory-trial/enqueue",
+                             json.dumps(self.services.deferred_enqueue).encode()), timeout=5):
+            variables = self.services.dag_runs[run_id]["params"]
+        late_launch = subprocess.run([
+            *launcher, "--run-id", run_id, "--repo", variables["FACTORY_REPO"],
+            "--issue", variables["FACTORY_ISSUE"], "--commit", variables["FACTORY_COMMIT"],
+            "--job", pending["job"],
+        ], env=env, capture_output=True, text=True, timeout=10)
+        self.assertEqual(late_launch.returncode, 1, late_launch.stderr)
+        self.assertFalse((self.root / "allocated").exists())
+        record = json.loads((self.root / "runs" / run_id / "run.json").read_text())
+        self.assertEqual(record["state"], "cancelled")
+
+        self.services.lose_response = True
+        self.command("dispatch", "--once")
+        seen, = json.loads(self.command("status"))
+        self.assertEqual(seen["dispatch"], "cancelling")
+        self.command("dispatch", "--once")
+        self.command("retry", "--run-id", run_id)
+        final, = json.loads(self.command("status"))
+        self.assertEqual(final["dispatch"], "cancelled")
+        self.assertEqual(final["job"], pending["job"])
+        self.assertNotIn(run_id, self.services.dag_runs)
 
 
 if __name__ == "__main__":

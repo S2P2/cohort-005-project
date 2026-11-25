@@ -77,18 +77,19 @@ def agent(payload):
             for line in process.stdout:
                 sys.stdout.buffer.write(line.replace(key.encode(), b"[redacted]"))
                 sys.stdout.buffer.flush()
-        if process.returncode:
-            return process.returncode
-        if not last_message.is_file() or last_message.read_text().strip() != MARKER:
-            print("The model response did not match the trial marker.", file=sys.stderr)
-            return 1
-        return 0
+        try:
+            marker_valid = last_message.read_bytes().strip() == MARKER.encode()
+        except OSError:
+            marker_valid = False
+        print(json.dumps({"exit_status": process.returncode, "marker_valid": marker_valid}),
+              file=sys.stderr, flush=True)
 
 
 try:
     request = json.load(sys.stdin)
     if request["action"] == "agent":
-        sys.exit(agent(request))
+        agent(request)
+        sys.exit(0)
     operation = {"checkout": checkout, "probe": probe}[request["action"]]
     sys.exit(0 if operation(request) else 1)
 except (OSError, ValueError, subprocess.SubprocessError):

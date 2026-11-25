@@ -1,9 +1,12 @@
 import json
 import os
 from pathlib import Path
+import signal
 import subprocess
 import sys
 import tempfile
+from threading import Timer
+import time
 import unittest
 
 
@@ -44,14 +47,146 @@ class TrialTest(unittest.TestCase):
         self.config = configure_trial(self.root)
         self.runs = self.root / "runs"
 
+    def args(self, *args):
+        return [sys.executable, str(LAUNCHER), "--config", str(self.config), *args]
+
+    def launch_args(self):
+        return self.args("--run-id", "trial-1", "--repo", "demo/trial", "--issue", "demo/trial#4",
+                         "--commit", COMMIT, "--job", "woodpecker:control/trial:1",
+                         "--startup", "cold")
+
+    def env(self, **env):
+        return {**os.environ, "FACTORY_FIXTURE": str(self.root), **env}
+
     def launch(self, **env):
-        return subprocess.run(
-            [sys.executable, str(LAUNCHER), "--config", str(self.config),
-             "--run-id", "trial-1", "--repo", "demo/trial", "--issue", "demo/trial#4",
-             "--commit", COMMIT, "--job", "woodpecker:control/trial:1", "--startup", "cold"],
-            env={**os.environ, "FACTORY_FIXTURE": str(self.root), **env},
-            text=True, capture_output=True, check=False,
-        )
+        return subprocess.run(self.launch_args(), env=self.env(**env), text=True,
+                              capture_output=True, timeout=10)
+
+    def control(self, *args, **env):
+        return subprocess.run(self.args(*args), env=self.env(**env), text=True,
+                              capture_output=True, timeout=10)
+
+    def start(self, case):
+        child = subprocess.Popen(self.launch_args(), env=self.env(FACTORY_CASE=case),
+                                 stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                 stderr=subprocess.DEVNULL)
+        self.addCleanup(child.wait, 10)
+        self.addCleanup(child.kill)
+        return child
+
+    def wait_for(self, predicate):
+        deadline = time.monotonic() + 5
+        while not predicate():
+            self.assertLess(time.monotonic(), deadline, "Fixture did not reach the interruption point.")
+            time.sleep(0.01)
+
+    def record(self):
+        return json.loads((self.runs / "trial-1" / "run.json").read_text())
+
+    def test_replay_reconciles_after_launcher_is_killed_during_allocation(self):
+        child = self.start("interrupt-allocation")
+        self.wait_for(lambda: (self.root / "allocating").exists())
+        child.kill()
+        child.wait(5)
+        (self.root / "release").touch()
+        recovery = self.control("reconcile", "--run-id", "trial-1")
+        self.assertEqual(recovery.returncode, 0, recovery.stderr)
+        self.assertEqual(self.record()["state"], "interrupted")
+        self.assertEqual(self.record()["vm_cleanup"], "removed")
+        self.assertFalse((self.root / "vm.json").exists())
+        (self.root / "allocated").unlink()
+        replay = self.launch()
+        self.assertEqual(replay.returncode, 1)
+        self.assertFalse((self.root / "allocated").exists())
+
+    def test_reconciliation_waits_for_server_allocation_after_client_is_killed(self):
+        child = self.start("server-allocation")
+        allocating = self.root / "allocating"
+        self.wait_for(allocating.exists)
+        details = json.loads(allocating.read_text())
+        child.kill()
+        child.wait(5)
+        os.kill(details["pid"], signal.SIGKILL)
+
+        def finish_server_allocation():
+            (self.root / "vm.json").write_text(json.dumps(details["instance"]))
+            (self.root / "incus-operation.json").unlink()
+
+        timer = Timer(0.4, finish_server_allocation)
+        timer.start()
+        self.addCleanup(timer.join, 5)
+        result = self.control("reconcile", "--run-id", "trial-1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.record()["state"], "interrupted")
+        self.assertFalse((self.root / "vm.json").exists())
+
+    def test_revokes_a_key_when_the_issuer_loses_its_response(self):
+        result = self.launch(FACTORY_CASE="lost-key-response")
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(self.record()["state"], "failed")
+        self.assertEqual(self.record()["magpie_key_id"], "fixture-key-id")
+        self.assertEqual(self.record()["magpie_cleanup"], "revoked")
+        self.assertFalse((self.root / "key").exists())
+
+    def test_cancel_fences_late_launch_and_confirms_guest_and_key_removal(self):
+        agent_log = self.runs / "trial-1" / "agent.log"
+        child = self.start("agent-interrupt")
+        self.wait_for(lambda: agent_log.exists() and "started agent" in agent_log.read_text())
+        result = self.control("cancel", "--run-id", "trial-1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(child.wait(5), 1)
+        self.assertEqual(self.record()["state"], "cancelled")
+        self.assertEqual(self.record()["vm_cleanup"], "removed")
+        self.assertEqual(self.record()["magpie_cleanup"], "revoked")
+        self.assertFalse(self.record()["output_complete"])
+        self.assertIn("started agent", agent_log.read_text())
+        self.assertFalse((self.root / "key").exists())
+        self.assertFalse((self.root / "vm.json").exists())
+        (self.root / "allocated").unlink()
+        self.assertEqual(self.launch().returncode, 1)
+        self.assertFalse((self.root / "allocated").exists())
+
+    def test_cancel_before_launch_survives_orchestrator_retry(self):
+        result = self.control("cancel", "--run-id", "trial-1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("cancelled before launch", result.stdout)
+        self.assertEqual(self.launch().returncode, 1)
+        self.assertEqual(self.record()["state"], "cancelled")
+        self.assertEqual(self.record()["vm_cleanup"], "not_allocated")
+        self.assertEqual(self.record()["magpie_cleanup"], "not_issued")
+        self.assertFalse((self.root / "allocated").exists())
+
+    def test_recovery_retries_unconfirmed_cleanup_after_kill_with_incomplete_output(self):
+        agent_log = self.runs / "trial-1" / "agent.log"
+        child = self.start("agent-interrupt")
+        self.wait_for(lambda: agent_log.exists() and "started agent" in agent_log.read_text())
+        child.kill()
+        child.wait(5)
+        (self.root / "vm.json").unlink()
+        result = self.control("reconcile", "--run-id", "trial-1", FACTORY_CASE="revoke-unavailable")
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(self.record()["state"], "cleanup_pending")
+        self.assertEqual(self.record()["outcome"], "interrupted")
+        self.assertEqual(self.record()["vm_cleanup"], "removed")
+        self.assertEqual(self.record()["magpie_cleanup"], "unconfirmed")
+        self.assertTrue((self.root / "key").exists())
+        result = self.control("reconcile")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.record()["state"], "interrupted")
+        self.assertEqual(self.record()["magpie_cleanup"], "revoked")
+        self.assertFalse((self.root / "key").exists())
+        self.assertFalse(self.record()["output_complete"])
+        self.assertIn("started agent", agent_log.read_text())
+
+    def test_provider_failure_keeps_output_and_exit_code_after_teardown(self):
+        result = self.launch(FACTORY_CASE="provider-error-with-marker")
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(self.record()["state"], "failed")
+        self.assertEqual(self.record()["agent_exit_status"], 42)
+        self.assertTrue(self.record()["output_complete"])
+        self.assertIn("Provider unavailable", (self.runs / "trial-1" / "agent.log").read_text())
+        self.assertFalse((self.root / "key").exists())
+        self.assertFalse((self.root / "vm.json").exists())
 
     def test_records_trial_and_removes_vm_and_magpie_key(self):
         result = self.launch()

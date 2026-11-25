@@ -23,9 +23,15 @@ profile = {
 if Path(sys.argv[0]).name == "issuer":
     if args == ["issue", os.environ.get("FIXTURE_RUN_ID", "trial-1"), "openai/example", "900"]:
         key.touch()
+        if case == "lost-key-response":
+            sys.exit(3)
         print(json.dumps({"id": "fixture-key-id", "key": "fixture-secret"}))
     elif args == ["revoke", "fixture-key-id"]:
-        key.unlink()
+        if case == "revoke-unavailable":
+            sys.exit(3)
+        key.unlink(missing_ok=True)
+    elif args == ["find", os.environ.get("FIXTURE_RUN_ID", "trial-1")]:
+        print(json.dumps(["fixture-key-id"] if key.exists() else []))
     else:
         sys.exit(2)
     sys.exit(0)
@@ -38,7 +44,11 @@ if args == ["query", "local:/1.0/profiles/trial?project=factory"]:
 
 assert args[:2] == ["--project", "factory"]
 command, *rest = args[2:]
-if command == "list":
+if command == "operation":
+    assert rest == ["list", "local:", "--format=json"]
+    pending = root / "incus-operation.json"
+    print("[" + pending.read_text() + "]" if pending.exists() else "[]")
+elif command == "list":
     assert rest == ["local:", "--format=json"]
     print("[" + vm.read_text() + "]" if vm.exists() else "[]")
 elif command == "init":
@@ -47,11 +57,27 @@ elif command == "init":
     assert rest[1].startswith("local:")
     config = dict(item.removeprefix("--config=").split("=", 1)
                   for item in rest if item.startswith("--config="))
-    vm.write_text(json.dumps({
+    instance = {
         "name": rest[1].removeprefix("local:"), "type": "virtual-machine",
         "expanded_config": {**profile["config"], **config, "volatile.base_image": fingerprint},
         "expanded_devices": profile["devices"],
-    }))
+    }
+    if case in {"interrupt-allocation", "server-allocation"}:
+        pending = root / "incus-operation.json"
+        pending.write_text(json.dumps({
+            "class": "task", "status_code": 103,
+            "resources": {"instances": [f"/1.0/instances/{instance['name']}"]},
+        }))
+        details = root / "allocating.tmp"
+        details.write_text(json.dumps({"instance": instance, "pid": os.getpid()}))
+        details.replace(root / "allocating")
+        deadline = time.monotonic() + 5
+        while not (root / "release").exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        vm.write_text(json.dumps(instance))
+        pending.unlink()
+    else:
+        vm.write_text(json.dumps(instance))
 elif command == "start":
     assert vm.exists()
 elif command == "exec":
@@ -74,9 +100,30 @@ elif command == "exec":
         print("f" * 40 if case == "wrong-ref" else payload["commit"])
     elif action == "agent":
         assert payload["key"] == "fixture-secret"
-        if case == "agent-timeout":
+        if case == "provider-error-with-marker":
+            executable = root / "codex"
+            executable.write_text(
+                f"#!{sys.executable}\n"
+                "from pathlib import Path\n"
+                "import sys\n"
+                'Path(sys.argv[sys.argv.index("--output-last-message") + 1]).write_text("FACTORY_TRIAL_OK")\n'
+                'print("Provider unavailable")\n'
+                "sys.exit(42)\n"
+            )
+            executable.chmod(0o700)
+            guest_home = root / "guest-home"
+            (guest_home / "repo").mkdir(parents=True)
+            guest = rest[-1].replace('Path("/home/factory")', f"Path({str(guest_home)!r})")
+            guest = guest.replace('"/usr/local/bin/codex"', repr(str(executable)))
+            sys.exit(subprocess.run([sys.executable, "-I", "-c", guest],
+                                    input=json.dumps(payload), text=True).returncode)
+        if case in {"agent-timeout", "revoke-unavailable", "agent-interrupt"}:
             print("started agent", flush=True)
-            time.sleep(10)
+            deadline = time.monotonic() + 5
+            while vm.exists() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            if not vm.exists():
+                sys.exit(4)
         print("FACTORY_TRIAL_OK")
     else:
         sys.exit(2)

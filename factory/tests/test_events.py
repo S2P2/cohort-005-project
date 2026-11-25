@@ -72,6 +72,10 @@ class Services(BaseHTTPRequestHandler):
             self.send_error(404)
             return
         body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+        if self.server.reject_next_submission:
+            self.server.reject_next_submission = False
+            self.send_error(503)
+            return
         pipeline = {
             "number": len(self.server.pipelines) + 1,
             "event": "manual",
@@ -96,6 +100,7 @@ class SignedEventsTest(unittest.TestCase):
         self.services.pipelines = []
         self.services.commit = COMMIT
         self.services.lose_response = False
+        self.services.reject_next_submission = False
         service_url = self.enterContext(running(self.services))
         self.config = self.root / "events.json"
         trial = self.root / "trial.json"
@@ -279,6 +284,50 @@ class SignedEventsTest(unittest.TestCase):
         self.assertEqual(confirmed["job"], "woodpecker:factory-control/launcher:1")
         self.assertEqual(confirmed["run_id"], initial["run_id"])
         self.assertEqual(len(self.services.pipelines), 1)
+
+    def test_operator_retry_recovers_an_unaccepted_submission_under_the_same_run_id(self):
+        self.seed_and_listen()
+        self.assertEqual(self.send(self.issue(4, "factory:run")), 202)
+        self.services.reject_next_submission = True
+        self.command("dispatch", "--once")
+        initial, = json.loads(self.command("status"))
+        self.assertEqual(initial["dispatch"], "submitting")
+        self.command("dispatch", "--once")
+        self.assertEqual(self.services.pipelines, [])
+        self.command("retry", "--run-id", initial["run_id"])
+        self.command("retry", "--run-id", initial["run_id"])
+        final, = json.loads(self.command("status"))
+        self.assertEqual(final["run_id"], initial["run_id"])
+        self.assertEqual(final["job"], "woodpecker:factory-control/launcher:1")
+        pipeline, = self.services.pipelines
+        self.assertEqual(pipeline["variables"]["FACTORY_COMMIT"], COMMIT)
+        self.assertEqual(pipeline["variables"]["FACTORY_RUN_ID"], initial["run_id"])
+        config = configure_trial(self.root)
+        variables = pipeline["variables"]
+        command = [
+            sys.executable, str(LAUNCHER), "--config", str(config),
+            "--run-id", variables["FACTORY_RUN_ID"], "--repo", variables["FACTORY_REPO"],
+            "--issue", variables["FACTORY_ISSUE"], "--commit", variables["FACTORY_COMMIT"],
+            "--job", final["job"],
+        ]
+        env = {**os.environ, "FACTORY_FIXTURE": str(self.root),
+               "FIXTURE_RUN_ID": final["run_id"]}
+        first = subprocess.run(command, env=env, capture_output=True, text=True, timeout=10)
+        self.assertEqual(first.returncode, 0, first.stderr)
+        record_path = self.root / "runs" / final["run_id"] / "run.json"
+        record = json.loads(record_path.read_text())
+        self.assertEqual(record["job"], final["job"])
+        self.assertEqual(record["issue"], final["issue"])
+        self.assertEqual(record["checked_out_commit"], final["commit_sha"])
+        self.assertEqual(record["magpie_key_id"], "fixture-key-id")
+        self.assertEqual(record["publication"], "disabled")
+        (self.root / "allocated").unlink()
+        replay = subprocess.run(command, env=env, capture_output=True, timeout=10)
+        self.assertEqual(replay.returncode, 1)
+        self.assertEqual(json.loads(record_path.read_text()), record)
+        self.assertFalse((self.root / "allocated").exists())
+        self.assertFalse((self.root / "vm.json").exists())
+        self.assertFalse((self.root / "key").exists())
 
 
 if __name__ == "__main__":

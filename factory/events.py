@@ -348,22 +348,33 @@ def webhook_server(settings, host, port):
     return ThreadingHTTPServer((host, port), Webhook)
 
 
-def dispatch(settings):
+def dispatch(settings, retry_id=None):
     with (settings.state_dir / "dispatch.lock").open("a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         with ledger(settings) as db:
             check_baseline(settings, db)
-            candidates = db.execute("SELECT * FROM runs WHERE dispatch != 'submitted' ORDER BY rowid").fetchall()
+            if retry_id is None:
+                candidates = db.execute(
+                    "SELECT * FROM runs WHERE dispatch != 'submitted' ORDER BY rowid"
+                ).fetchall()
+            else:
+                row = db.execute("SELECT * FROM runs WHERE run_id = ?", (retry_id,)).fetchone()
+                if row is None:
+                    raise EventError("Unknown logical run ID.")
+                candidates = [] if row["dispatch"] == "submitted" else [row]
         for row in candidates:
             run = RunRequest(row["run_id"], row["repo"], row["issue"], row["commit_sha"])
             try:
-                if row["dispatch"] == "queued":
+                job = None
+                if row["dispatch"] != "queued" or retry_id is not None:
+                    job = settings.orchestrator.find(run.run_id)
+                if job is None and (row["dispatch"] == "queued" or retry_id is not None):
                     with ledger(settings) as db:
                         db.execute("UPDATE runs SET dispatch = 'submitting' WHERE run_id = ?", (run.run_id,))
                     job = settings.orchestrator.submit(run)
-                else:
-                    job = settings.orchestrator.find(run.run_id)
             except UPSTREAM_ERRORS:
+                if retry_id is not None:
+                    raise EventError(f"Orchestrator request unconfirmed for {run.run_id}.") from None
                 print(f"Orchestrator request unconfirmed for {run.run_id}.", file=sys.stderr)
                 continue
             if job is not None:
@@ -383,6 +394,8 @@ def main():
     serve.add_argument("--port", default=8765, type=int)
     worker = commands.add_parser("dispatch")
     worker.add_argument("--once", action="store_true")
+    retry = commands.add_parser("retry")
+    retry.add_argument("--run-id", required=True)
     args = parser.parse_args()
     os.umask(0o077)
     try:
@@ -396,6 +409,8 @@ def main():
             with ledger(settings) as db:
                 check_baseline(settings, db)
                 print(json.dumps([dict(row) for row in db.execute("SELECT * FROM runs ORDER BY rowid")]))
+        elif args.command == "retry":
+            dispatch(settings, retry_id=args.run_id)
         else:
             while True:
                 dispatch(settings)

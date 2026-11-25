@@ -29,10 +29,13 @@ Configure an absolute path to an operator-owned executable. It uses the installe
 
 ```text
 issue <logical-run-id> <one-model> <ttl-seconds>
+find <logical-run-id>
 revoke <key-id>
 ```
 
-`issue` must write a single JSON object containing `id` (an opaque identifier) and `key` (the bearer secret) to stdout. Issue only a key with the supplied run ID as its name, one allowed model, limited provider accounts and a lifetime no greater than the requested TTL. Disable key issuance, admin, MCP and memory on that key. The launcher currently requests 900 seconds. If the issuer allocates a key and fails before reporting the ID, the issuer must attempt to revoke it, and the operator can look up the run ID in Magpie.
+`issue` must write a single JSON object containing `id` (an opaque identifier) and `key` (the bearer secret) to stdout. Issue only a key with the supplied run ID as its name, one allowed model, limited provider accounts and a lifetime no greater than the requested TTL. Disable key issuance, admin, MCP and memory on that key. The launcher currently requests 900 seconds. Reserve these run names under the issuer for this launcher.
+
+`find` must return a JSON list of key IDs for that exact run name and issuer, including any key created before an interrupted or ambiguous issue response. An empty list confirms absence. The included issuer reads Magpie 0.1.4708's local `caller-keys.json` in the configured `magpie/` directory and emits only matching IDs. Custom issuers must provide the same authoritative lookup and settle any outstanding issue request before returning an empty list.
 
 `revoke` must exit zero only once the referenced key is removed or confirmed absent. Keep the returned bearer secret out of process arguments, Woodpecker variables and logs. The launcher reads issuance stdout privately, stores only the ID in the run record, and supplies the secret to the guest on Incus exec stdin. The Codex subprocess sees the secret as its model provider environment variable.
 
@@ -67,7 +70,7 @@ python3 factory/launch.py --config /etc/factory/trial.json \
   --job woodpecker:factory-control/launcher:123 --startup cold
 ```
 
-Any orchestrator can supply the same interface with its own `--job` value. The launcher creates a private directory named for the logical run ID, persists the VM name and allocation identity before requesting allocation, and atomically updates `run.json` through startup, checkout, issuance, execution, and teardown. It preserves agent stdout and stderr in `agent.log` and records when collection was incomplete. A duplicate logical ID fails before allocating another VM. The record includes the Incus project, ownership marker and key ID for a later reconciler. Ticket #6 owns restart reconciliation and cancellation. Inspect a failed or unfinished record before taking any manual action on the recorded VM or key.
+Any orchestrator can supply the same interface with its own `--job` value. The launcher creates a private directory named for the logical run ID, persists the VM name and allocation identity before requesting allocation, and atomically updates `run.json` through startup, checkout, issuance, execution, and teardown. It preserves agent stdout and stderr in `agent.log` and records when collection was incomplete. A duplicate logical ID can reconcile the original run and exits before allocating another VM. Use the [recovery drill](recovery-report.md) for restart, cancellation, retry and independent verification commands.
 
 ## Signed Forgejo events
 
@@ -102,7 +105,7 @@ Forgejo v17.0.2 sent the previous label set for add, remove, reapply and clear o
 | Removal and reapplication both happen before any read observes the removal | The observed state stays present and the adapter cannot reconstruct a second application. The same limitation applies to a brief add followed by removal between observations. |
 | Forgejo reads or the SQLite commit fail | The adapter returns `503`. Check the Forgejo delivery history and redeliver after fixing the dependency. The redelivery sees the current issue state. |
 
-The dispatch worker uses the persisted SHA even when the target branch advances. Keep the SHA reachable in Forgejo until the guest fetches it. The control workflow still comes from its own protected `main`. If a submission response is lost, `submitting` remains durable and the worker looks up the exact `MANUAL: <run ID> @ main` marker across manual pipelines. An absent match leaves the run in `submitting` for reconciliation. This avoids resubmitting blindly after an ambiguous request or a worker crash. Ticket #6 owns the retry decision, execution recovery and cancellation. Ticket #7 can use the same dispatch request and implement `submit(run)` and `find(run_id)` for Dagu.
+The dispatch worker uses the persisted SHA even when the target branch advances. Keep the SHA reachable in Forgejo until the guest fetches it. The control workflow still comes from its own protected `main`. If a submission response is lost, `submitting` remains durable and the worker looks up the exact `MANUAL: <run ID> @ main` marker across manual pipelines. An absent match leaves the run in `submitting` until an operator uses `events.py retry --run-id <run-id>` after checking that the original request has settled. Ticket #7 can use the same dispatch request and implement `submit(run)` and `find(run_id)` for Dagu.
 
 ## Verification
 

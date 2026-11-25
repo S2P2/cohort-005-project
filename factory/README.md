@@ -69,10 +69,47 @@ python3 factory/launch.py --config /etc/factory/trial.json \
 
 Any orchestrator can supply the same interface with its own `--job` value. The launcher creates a private directory named for the logical run ID, persists the VM name and allocation identity before requesting allocation, and atomically updates `run.json` through startup, checkout, issuance, execution, and teardown. It preserves agent stdout and stderr in `agent.log` and records when collection was incomplete. A duplicate logical ID fails before allocating another VM. The record includes the Incus project, ownership marker and key ID for a later reconciler. Ticket #6 owns restart reconciliation and cancellation. Inspect a failed or unfinished record before taking any manual action on the recorded VM or key.
 
+## Signed Forgejo events
+
+The adapter accepts Forgejo v17.0.2 issue-open and issue-label notifications at `POST /forgejo`. It validates the HMAC over the request bytes and the exact repository name against a subset of the launcher allowlist. It reads current issue labels from Forgejo. When the trigger changes from absent to present, it resolves the configured target branch to a full commit SHA. Before returning HTTP `202`, it commits the delivery UUID, body digest, issue observation and any new dispatch record in a single SQLite transaction. The ledger keeps correlation metadata and excludes issue bodies and authorization headers. A repeated delivery with the same body receives `202`. Reuse of the UUID with a different body receives `409`.
+
+### Operator stages to confirm for the wizard
+
+The wizard is awaiting confirmation of the ordered setup stages. Extend the existing Forgejo and Woodpecker stages and add the cutover stage after both services are ready.
+
+| Stage | Operator action | Value destination |
+| --- | --- | --- |
+| Forgejo | Confirm the trusted target repo, exact trigger label, target branch, and repository-scoped API access for reading issues and branches (`read:issue` and `read:repository`). Generate a dedicated webhook secret. | `repositories`, `label`, `forgejo.url` and secret file paths in `/etc/factory/events.json`. Store API tokens and the webhook secret as private `0600` regular files owned by the adapter account or mount equivalent files from the host secret store. Use the same webhook secret in Forgejo hook settings. |
+| Woodpecker | Confirm v3.20.1, activate the protected `factory-control/launcher` repo and identify its numeric Woodpecker repository ID. Issue a dedicated token for an account authorized to list and submit this control repo's manual pipelines. | `woodpecker.url`, `woodpecker.repo_id` and `woodpecker.token_file` in `/etc/factory/events.json`. Store the token in a private file as above. Keep protected `main` and the dedicated agent restrictions from the manual setup. |
+| Adapter and cutover | Install `events.py` as an operator-owned file at `/opt/factory/events.py`. Set up a fixed service account, private `0700` local state directory and reverse-proxy route from Forgejo to `127.0.0.1:8765/forgejo`. Confirm a quiet interval and seed before enabling the webhook. Install supervised processes for `serve` and `dispatch` under the same adapter account. | Operator-owned `/etc/factory/events.json` from `events.example.json`, service-owned `/var/lib/factory/events`, and a repository-level Forgejo webhook. Keep ledger state on durable local storage and preserve it across restarts. |
+
+Use a separate adapter account from the Incus launcher where practical. The adapter needs read access to the launcher config to validate repository names. Keep the VM manager and guest credentials under the launcher account. The reverse proxy should preserve the raw request body, enforce the 1 MiB body limit, and allow enough time for the adapter to commit its Forgejo reads. API endpoints accept HTTPS or local loopback HTTP.
+
+### Quiet cutover
+
+1. Pause issue creation and label changes on the configured repositories. Leave the webhook disabled and let any earlier changes settle. Confirm that the Forgejo service account can see every target issue, including closed issues.
+2. As the adapter account, run `python3 /opt/factory/events.py --config /etc/factory/events.json seed`. The seed reads every page of existing issue-label state and creates zero runs. It refuses a second seed on the same ledger.
+3. Start the supervised `serve` and `dispatch` commands with the same `--config` path. Register or enable a **Forgejo** repository webhook with JSON content type, the shared secret, and events `issues` and `issue_label`. Point it at the `/forgejo` reverse-proxy URL. Leave issue and label edits paused until the listener and webhook are ready.
+4. Open a new smoke issue with the trigger label and verify the delivery received `202`. Run `python3 /opt/factory/events.py --config /etc/factory/events.json status` to find the run ID, issue, SHA, dispatch state and Woodpecker job. Open the job and check the launcher record under the same run ID. Repeat for an added label and for a removal followed by reapplication. Wait for the removal's accepted delivery before reapplying.
+
+Forgejo v17.0.2 sent the previous label set for add, remove, reapply and clear operations in a loopback probe. The payload contained no label delta, and multiple actions shared `updated_at`. An immediate read also sometimes returned the pre-change labels. The adapter allows 250 ms for label updates to settle before it reads the issue's labels endpoint and compares with durable prior state. This delay covered the loopback race and the HTTP fixture, and a longer upstream visibility lag can still hide a transition. The HTTP fixtures exercised these cases:
+
+| Delivery scenario | Observation |
+| --- | --- |
+| Duplicate UUID or unrelated label edit while the trigger remains present | The run count stays the same. |
+| A stale notification arrives after an observed application | The current Forgejo label state wins, so a stale snapshot cannot reset the issue. |
+| An application notification is missed but the label remains present | A subsequent eligible delivery for that issue can observe the application and record the SHA at that time. |
+| Removal and reapplication both happen before any read observes the removal | The observed state stays present and the adapter cannot reconstruct a second application. The same limitation applies to a brief add followed by removal between observations. |
+| Forgejo reads or the SQLite commit fail | The adapter returns `503`. Check the Forgejo delivery history and redeliver after fixing the dependency. The redelivery sees the current issue state. |
+
+The dispatch worker uses the persisted SHA even when the target branch advances. Keep the SHA reachable in Forgejo until the guest fetches it. The control workflow still comes from its own protected `main`. If a submission response is lost, `submitting` remains durable and the worker looks up the exact `MANUAL: <run ID> @ main` marker across manual pipelines. An absent match leaves the run in `submitting` for reconciliation. This avoids resubmitting blindly after an ambiguous request or a worker crash. Ticket #6 owns the retry decision, execution recovery and cancellation. Ticket #7 can use the same dispatch request and implement `submit(run)` and `find(run_id)` for Dagu.
+
 ## Verification
 
 ```bash
 PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s factory/tests -v
 ```
 
-The fixture suite exercises the public launcher CLI against local executable stand-ins for Incus and the issuer. It verifies the retained run record and output, cleanup, network probe input, a rejected host directory device, a checkout mismatch, a duplicate run ID, and partial output after timeout. Woodpecker CLI v3.20.0 passes strict lint. A local backend check with a substitute launcher executes the manual workflow with an empty workspace and filters out push events. The live acceptance evidence comes from the KVM host, Woodpecker server pipeline, Forgejo fetch, guest probes and Magpie model call listed above.
+The fixture suite exercises the signed HTTP endpoint and dispatch CLI with local Forgejo and Woodpecker HTTP stand-ins. The queued-branch test advances a real Git branch, starts the public launcher with the pipeline's variables and runs the guest checkout against the local repository in a substitute Incus environment. It verifies the recorded SHA, detached checkout and cleanup. The launcher suite also verifies retained output, network probe input, a rejected host directory device, a checkout mismatch, a duplicate run ID and partial output after timeout. Woodpecker CLI v3.20.0 passes strict lint. A local backend check with a substitute launcher executes the manual workflow with an empty workspace and filters out push events.
+
+The adapter received all five signed deliveries from a temporary Forgejo v17.0.2 loopback service. Labeled creation and reapplication each queued one run. Unrelated edits, removal and clearing kept the run count unchanged. Woodpecker v3.20.1 submission and lookup fields were checked against its upstream source. End-to-end acceptance still requires the provisioned KVM host, actual Woodpecker queue, Forgejo checkout, guest probes and Magpie model call.

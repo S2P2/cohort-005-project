@@ -1,6 +1,7 @@
 import json
 import os
 from pathlib import Path
+import subprocess
 import sys
 import time
 
@@ -20,7 +21,7 @@ profile = {
 }
 
 if Path(sys.argv[0]).name == "issuer":
-    if args == ["issue", "trial-1", "openai/example", "900"]:
+    if args == ["issue", os.environ.get("FIXTURE_RUN_ID", "trial-1"), "openai/example", "900"]:
         key.touch()
         print(json.dumps({"id": "fixture-key-id", "key": "fixture-secret"}))
     elif args == ["revoke", "fixture-key-id"]:
@@ -63,6 +64,13 @@ elif command == "exec":
         assert payload["required"] == [["forgejo.example", 443], ["magpie.example", 443]]
         assert payload["blocked"] == [["192.0.2.1", 8443]]
     elif action == "checkout":
+        if origin := os.environ.get("FIXTURE_GIT_ORIGIN"):
+            guest_home = root / "guest-home"
+            guest_home.mkdir()
+            guest = rest[-1].replace('Path("/home/factory")', f"Path({str(guest_home)!r})")
+            payload["url"] = origin
+            sys.exit(subprocess.run([sys.executable, "-I", "-c", guest],
+                                    input=json.dumps(payload), text=True).returncode)
         print("f" * 40 if case == "wrong-ref" else payload["commit"])
     elif action == "agent":
         assert payload["key"] == "fixture-secret"

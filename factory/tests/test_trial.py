@@ -11,32 +11,38 @@ LAUNCHER = Path(__file__).resolve().parents[1] / "launch.py"
 COMMIT = "1234567890abcdef" * 2 + "12345678"
 
 
+def configure_trial(root):
+    config = root / "config.json"
+    runs = root / "runs"
+    runs.mkdir(mode=0o700)
+    fixture = Path(__file__).with_name("service_fixture.py")
+    for name in ("incus", "issuer"):
+        executable = root / name
+        executable.write_text(f"#!{sys.executable}\n" + fixture.read_text())
+        executable.chmod(0o700)
+    config.write_text(json.dumps({
+        "run_root": str(runs),
+        "incus": str(root / "incus"),
+        "incus_project": "factory",
+        "incus_profile": "trial",
+        "incus_network": "trial-net",
+        "image_fingerprint": "a" * 64,
+        "issuer": str(root / "issuer"),
+        "magpie_url": "https://magpie.example/v1",
+        "magpie_model": "openai/example",
+        "blocked_endpoints": [["192.0.2.1", 8443]],
+        "repositories": {"demo/trial": {"url": "https://forgejo.example/demo/trial.git"}},
+    }))
+    return config
+
+
 class TrialTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name)
-        self.config = self.root / "config.json"
+        self.config = configure_trial(self.root)
         self.runs = self.root / "runs"
-        self.runs.mkdir(mode=0o700)
-        fixture = Path(__file__).with_name("service_fixture.py")
-        for name in ("incus", "issuer"):
-            executable = self.root / name
-            executable.write_text(f"#!{sys.executable}\n" + fixture.read_text())
-            executable.chmod(0o700)
-        self.config.write_text(json.dumps({
-            "run_root": str(self.runs),
-            "incus": str(self.root / "incus"),
-            "incus_project": "factory",
-            "incus_profile": "trial",
-            "incus_network": "trial-net",
-            "image_fingerprint": "a" * 64,
-            "issuer": str(self.root / "issuer"),
-            "magpie_url": "https://magpie.example/v1",
-            "magpie_model": "openai/example",
-            "blocked_endpoints": [["192.0.2.1", 8443]],
-            "repositories": {"demo/trial": {"url": "https://forgejo.example/demo/trial.git"}},
-        }))
 
     def launch(self, **env):
         return subprocess.run(

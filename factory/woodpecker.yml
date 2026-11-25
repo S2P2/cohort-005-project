@@ -11,4 +11,6 @@ when:
 
 steps:
   - name: isolated-trial
-    image: /opt/factory/woodpecker-entrypoint.py
+    image: /bin/sh
+    commands:
+      - exec /opt/factory/woodpecker-entrypoint.py

@@ -344,6 +344,10 @@ class Run:
             checked(process([issuer, "revoke", key_id], lease=self.lease), "Magpie revoke")
         self.save(magpie_cleanup="revoked" if key_ids else "not_issued")
 
+    def cleanup_complete(self):
+        return (self.record["vm_cleanup"] in {"not_allocated", "removed"}
+                and self.record["magpie_cleanup"] in {"not_issued", "revoked"})
+
 
 RECOVERY_ERRORS = (TrialError, subprocess.SubprocessError, OSError, ValueError, KeyError, TypeError)
 TERMINAL = {"succeeded", "failed", "interrupted", "cancelled"}
@@ -360,8 +364,7 @@ def finish(run, outcome, error):
     if log.is_file():
         with log.open("rb") as output:
             os.fsync(output.fileno())
-    if (run.record["vm_cleanup"] not in {"not_allocated", "removed"}
-            or run.record["magpie_cleanup"] not in {"not_issued", "revoked"}):
+    if not run.cleanup_complete():
         raise TrialError(f"Cleanup remains unconfirmed for {run.record['run_id']}.")
     run.save(state=outcome, finished_at=datetime.now(timezone.utc).isoformat())
 
@@ -370,8 +373,7 @@ def reconcile(run):
     if run.record is None:
         return
     state = run.record["state"]
-    if (state in TERMINAL and run.record["vm_cleanup"] in {"not_allocated", "removed"}
-            and run.record["magpie_cleanup"] in {"not_issued", "revoked"}):
+    if state in TERMINAL and run.cleanup_complete():
         return
     if state == "cleanup_pending":
         finish(run, run.record["outcome"], run.record["error"])

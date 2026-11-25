@@ -357,6 +357,27 @@ SERVICE_ERRORS = (*UPSTREAM_ERRORS, sqlite3.Error)
 EVENTS = {("issues", "opened"), ("issue_label", "label_updated"), ("issue_label", "label_cleared")}
 
 
+@dataclass(frozen=True)
+class IssueEvent:
+    repo: str
+    number: int
+    action: str
+    pull_request: bool
+
+    @classmethod
+    def parse(cls, body):
+        payload = json.loads(body)
+        if not isinstance(payload, dict):
+            raise EventError("Expected a Forgejo issue event.")
+        repo, issue, action = (payload.get(key) for key in ("repository", "issue", "action"))
+        if not isinstance(repo, dict) or not isinstance(issue, dict) or not isinstance(action, str):
+            raise EventError("Expected a repository, issue and action.")
+        name = repo.get("full_name")
+        if not isinstance(name, str) or not name:
+            raise EventError("Expected a repository full name.")
+        return cls(name, issue_number(issue), action, issue.get("pull_request") is not None)
+
+
 def webhook_server(settings, host, port):
     with ledger(settings) as db:
         check_baseline(settings, db)
@@ -395,24 +416,20 @@ def webhook_server(settings, host, port):
                 return 401
             try:
                 delivery = str(UUID(self.headers.get("X-Forgejo-Delivery", "")))
-                payload = json.loads(body)
-                event_type = self.headers.get("X-Forgejo-Event-Type")
-                action = payload["action"]
-                if self.headers.get("X-Forgejo-Event") != "issues" or (event_type, action) not in EVENTS:
-                    return 422
-                repo = payload["repository"]["full_name"]
-                if repo not in settings.repositories:
-                    return 403
-                issue = payload["issue"]
-                if issue.get("pull_request") is not None:
-                    return 422
-                number = issue_number(issue)
-            except (ValueError, KeyError, TypeError, AttributeError, EventError):
+                event = IssueEvent.parse(body)
+            except (ValueError, EventError):
                 return 400
+            event_type = self.headers.get("X-Forgejo-Event-Type")
+            if (self.headers.get("X-Forgejo-Event") != "issues" or event.pull_request
+                    or (event_type, event.action) not in EVENTS):
+                return 422
+            if event.repo not in settings.repositories:
+                return 403
             if event_type == "issue_label":
                 time.sleep(LABEL_SETTLE_SECONDS)
             try:
-                return ingest(settings, delivery, hashlib.sha256(body).hexdigest(), repo, number, event_type)
+                return ingest(settings, delivery, hashlib.sha256(body).hexdigest(),
+                              event.repo, event.number, event_type)
             except SERVICE_ERRORS:
                 print(f"Unable to commit Forgejo delivery {delivery}.", file=sys.stderr)
                 return 503

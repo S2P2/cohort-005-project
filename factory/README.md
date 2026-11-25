@@ -1,6 +1,6 @@
 # Factory infrastructure trial
 
-Run a minimal Codex invocation in a fresh Incus VM through a dedicated Woodpecker local agent. The trial is for one operator and a trusted Forgejo repository with a harmless commit. A repository containing agent instructions, plugins, hooks or executable build steps is unsuitable for the smoke test. Use a small README-only repository with a matching test issue.
+Run a minimal Codex invocation in a fresh Incus VM through Woodpecker or Dagu. Both use the same host launcher, guest image and Magpie gateway. The trial is for one operator and a trusted Forgejo repository with a harmless commit. Use a small README-only repository with a matching test issue.
 
 ## Operator setup
 
@@ -78,22 +78,30 @@ The adapter accepts Forgejo v17.0.2 issue-open and issue-label notifications at 
 
 ### Operator stages to confirm for the wizard
 
-The wizard is awaiting confirmation of the ordered setup stages. Extend the existing Forgejo and Woodpecker stages and add the cutover stage after both services are ready.
+The wizard is awaiting confirmation of the host and the ordered setup stages. Use one backend per adapter ledger. For a comparison, use separate trial ledgers and enable one webhook at a time so a label application does not fan out to both backends.
 
 | Stage | Operator action | Value destination |
 | --- | --- | --- |
 | Forgejo | Confirm the trusted target repo, exact trigger label, target branch, and repository-scoped API access for reading issues and branches (`read:issue` and `read:repository`). Generate a dedicated webhook secret. | `repositories`, `label`, `forgejo.url` and secret file paths in `/etc/factory/events.json`. Store API tokens and the webhook secret as private `0600` regular files owned by the adapter account or mount equivalent files from the host secret store. Use the same webhook secret in Forgejo hook settings. |
 | Woodpecker | Confirm v3.20.1, activate the protected `factory-control/launcher` repo and identify its numeric Woodpecker repository ID. Issue a dedicated token for an account authorized to list and submit this control repo's manual pipelines. | `woodpecker.url`, `woodpecker.repo_id` and `woodpecker.token_file` in `/etc/factory/events.json`. Store the token in a private file as above. Keep protected `main` and the dedicated agent restrictions from the manual setup. |
-| Adapter and cutover | Install `events.py` as an operator-owned file at `/opt/factory/events.py`. Set up a fixed service account, private `0700` local state directory and reverse-proxy route from Forgejo to `127.0.0.1:8765/forgejo`. Confirm a quiet interval and seed before enabling the webhook. Install supervised processes for `serve` and `dispatch` under the same adapter account. | Operator-owned `/etc/factory/events.json` from `events.example.json`, service-owned `/var/lib/factory/events`, and a repository-level Forgejo webhook. Keep ledger state on durable local storage and preserve it across restarts. |
+| Dagu | Confirm v2.27.0, the local execution account, durable storage, built-in authentication and a dedicated REST API key with the operator role. | Operator-owned `factory-trial.yaml` in Dagu's DAG directory, `dagu.url` and `dagu.token_file` in `/etc/factory/events-dagu.json`, and the API key in a private file as above. |
+| Adapter and trial baseline | Install `events.py` as an operator-owned file at `/opt/factory/events.py`. Set up a fixed service account, private `0700` local state directory and reverse-proxy route from Forgejo to `127.0.0.1:8765/forgejo`. Confirm a quiet interval and seed before enabling the webhook. Install supervised processes for `serve` and `dispatch` under the same adapter account. | Operator-owned `/etc/factory/events.json` or `/etc/factory/events-dagu.json` from the corresponding example, a service-owned state directory, and a repository-level Forgejo webhook. Keep ledger state on durable local storage and preserve it across restarts. |
 
 Use a separate adapter account from the Incus launcher where practical. The adapter needs read access to the launcher config to validate repository names. Keep the VM manager and guest credentials under the launcher account. The reverse proxy should preserve the raw request body, enforce the 1 MiB body limit, and allow enough time for the adapter to commit its Forgejo reads. API endpoints accept HTTPS or local loopback HTTP.
 
-### Quiet cutover
+### Dagu service setup
+
+1. Run the pinned Dagu binary and local scheduler under the host launcher account. Bind the service to loopback or put it behind authenticated access on a private HTTPS endpoint. Use built-in authentication, keep the administration account with the operator, and give the adapter a dedicated service-account API key with the `operator` role and `rest_api` surface. The trial uses a dedicated Dagu instance because this role can run existing definitions on that instance.
+2. Persist the Dagu home, queue, run history and logs across restarts. Keep the DAG definition directory operator-writable only and install [factory-trial.yaml](factory-trial.yaml) with that exact filename. Install [dagu-entrypoint.py](dagu-entrypoint.py) at `/opt/factory/dagu-entrypoint.py` with executable permissions and the same root-owned `launch.py`, `guest.py` and `/etc/factory/trial.json` used by Woodpecker. The workflow executes a fixed command and the entrypoint passes checked run identity and the four input fields to the launcher. Target checkout takes place in the guest.
+3. Verify the DAG with `dagu validate` and check that authenticated API lookup can read it. To keep work queued for a restart drill, run `dagu server` with the scheduler stopped. Restart with the same storage, verify the run is still queued, then use `dagu start-all` without a distributed coordinator, or start the supervised local scheduler separately.
+4. Copy [events.dagu.example.json](events.dagu.example.json) to `/etc/factory/events-dagu.json` and apply the trial baseline steps with that path. Store the bearer secret in a private file owned by the adapter account. For manual cold and warm runs, set `FACTORY_STARTUP` and make `FACTORY_RUN_ID` and the Dagu run ID identical.
+
+### Quiet trial baseline
 
 1. Pause issue creation and label changes on the configured repositories. Leave the webhook disabled and let any earlier changes settle. Confirm that the Forgejo service account can see every target issue, including closed issues.
 2. As the adapter account, run `python3 /opt/factory/events.py --config /etc/factory/events.json seed`. The seed reads every page of existing issue-label state and creates zero runs. It refuses a second seed on the same ledger.
 3. Start the supervised `serve` and `dispatch` commands with the same `--config` path. Register or enable a **Forgejo** repository webhook with JSON content type, the shared secret, and events `issues` and `issue_label`. Point it at the `/forgejo` reverse-proxy URL. Leave issue and label edits paused until the listener and webhook are ready.
-4. Open a new smoke issue with the trigger label and verify the delivery received `202`. Run `python3 /opt/factory/events.py --config /etc/factory/events.json status` to find the run ID, issue, SHA, dispatch state and Woodpecker job. Open the job and check the launcher record under the same run ID. Repeat for an added label and for a removal followed by reapplication. Wait for the removal's accepted delivery before reapplying.
+4. Open a new smoke issue with the trigger label and verify the delivery received `202`. Run `python3 /opt/factory/events.py --config /etc/factory/events.json status` to find the run ID, issue, SHA, dispatch state and scheduler job. Open the job and check the launcher record under the same run ID. Repeat for an added label and for a removal followed by reapplication. Wait for the removal's accepted delivery before reapplying.
 
 Forgejo v17.0.2 sent the previous label set for add, remove, reapply and clear operations in a loopback probe. The payload contained no label delta, and multiple actions shared `updated_at`. An immediate read also sometimes returned the pre-change labels. The adapter allows 250 ms for label updates to settle before it reads the issue's labels endpoint and compares with durable prior state. This delay covered the loopback race and the HTTP fixture, and a longer upstream visibility lag can still hide a transition. The HTTP fixtures exercised these cases:
 
@@ -105,7 +113,7 @@ Forgejo v17.0.2 sent the previous label set for add, remove, reapply and clear o
 | Removal and reapplication both happen before any read observes the removal | The observed state stays present and the adapter cannot reconstruct a second application. The same limitation applies to a brief add followed by removal between observations. |
 | Forgejo reads or the SQLite commit fail | The adapter returns `503`. Check the Forgejo delivery history and redeliver after fixing the dependency. The redelivery sees the current issue state. |
 
-The dispatch worker uses the persisted SHA even when the target branch advances. Keep the SHA reachable in Forgejo until the guest fetches it. The control workflow still comes from its own protected `main`. If a submission response is lost, `submitting` remains durable and the worker looks up the exact `MANUAL: <run ID> @ main` marker across manual pipelines. An absent match leaves the run in `submitting` until an operator uses `events.py retry --run-id <run-id>` after checking that the original request has settled. Ticket #7 can use the same dispatch request and implement `submit(run)` and `find(run_id)` for Dagu.
+The dispatch worker uses the persisted SHA even when the target branch advances. Keep the SHA reachable in Forgejo until the guest fetches it. Woodpecker uses its protected control branch and looks up the exact `MANUAL: <run ID> @ main` marker across manual pipelines. Dagu uses the installed workflow and looks up the caller-supplied ID directly. An ambiguous response leaves the run in `submitting` until a lookup finds it or an operator uses `events.py retry --run-id <run-id>` after checking that the original request has settled. See the [recovery drill and comparison](recovery-report.md) for cancellation and the remaining live verification.
 
 ## Verification
 
@@ -113,7 +121,7 @@ The dispatch worker uses the persisted SHA even when the target branch advances.
 PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s factory/tests -v
 ```
 
-The fixture suite exercises the signed HTTP endpoint and dispatch CLI with local Forgejo and Woodpecker HTTP stand-ins. The queued-branch test advances a real Git branch, starts the public launcher with the pipeline's variables and runs the guest checkout against the local repository in a substitute Incus environment. It verifies the recorded SHA, detached checkout and cleanup. The launcher suite also verifies retained output, network probe input, a rejected host directory device, a checkout mismatch, a duplicate run ID and partial output after timeout. Woodpecker CLI v3.20.0 passes strict lint. A local backend check with a substitute launcher executes the manual workflow with an empty workspace and filters out push events.
+The fixture suite exercises the same signed HTTP, dispatch, branch advance and launcher replay scenarios with local Forgejo, Woodpecker and Dagu stand-ins. The queued-branch test advances a real Git branch and runs the guest checkout against the local repository in a substitute Incus environment. It verifies the recorded SHA, detached checkout and cleanup. The shared launcher suite also checks retained output, network probe input, host directory rejection, checkout mismatch, duplicate run ID and partial output after timeout.
 
 The adapter received all five signed deliveries from a temporary Forgejo v17.0.2 loopback service. Labeled creation and reapplication each queued one run. Unrelated edits, removal and clearing kept the run count unchanged.
 

@@ -40,7 +40,7 @@ def require(condition, message):
 def endpoint(url):
     parsed = urlsplit(url)
     require(parsed.scheme == "https" and parsed.hostname and not (
-        parsed.username or parsed.password or parsed.query or parsed.fragment
+        parsed.username is not None or parsed.query or parsed.fragment
     ), "Expected a credential-free HTTPS endpoint.")
     return [parsed.hostname, parsed.port or 443]
 

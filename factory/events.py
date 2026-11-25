@@ -23,12 +23,19 @@ from uuid import UUID, uuid4
 
 CONTROL_REPO = "factory-control/launcher"
 CONTROL_BRANCH = "main"
+DAG_NAME = "factory-trial"
 MAX_PAYLOAD = 1024 * 1024
 LABEL_SETTLE_SECONDS = 0.25
 
 
 class EventError(Exception):
     pass
+
+
+class APIError(EventError):
+    def __init__(self, status):
+        super().__init__(f"Service returned HTTP {status}.")
+        self.status = status
 
 
 def private_secret(filename):
@@ -74,9 +81,11 @@ class Settings:
         if not isinstance(label, str) or not label:
             raise EventError("Configure a trigger label.")
         forgejo = config["forgejo"]
-        woodpecker = config["woodpecker"]
+        if ("woodpecker" in config) == ("dagu" in config):
+            raise EventError("Configure exactly one orchestrator.")
+        orchestrator = Dagu(config["dagu"]) if "dagu" in config else Woodpecker(config["woodpecker"])
         return cls(root, label, repositories, private_secret(forgejo["webhook_secret_file"]),
-                   Forgejo(forgejo), Woodpecker(woodpecker))
+                   Forgejo(forgejo), orchestrator)
 
 
 class NoRedirect(HTTPRedirectHandler):
@@ -91,7 +100,7 @@ class API:
         secure = url.scheme == "https"
         loopback = url.scheme == "http" and url.hostname in {"127.0.0.1", "::1"}
         if not (secure or loopback) or not url.hostname or (
-            url.username or url.password or url.query or url.fragment
+            url.username is not None or url.query or url.fragment
         ):
             raise EventError("Use a credential-free HTTPS service URL or a loopback HTTP URL.")
         self.authorization = authorization + private_secret(config["token_file"]).decode("ascii")
@@ -99,7 +108,7 @@ class API:
             raise EventError("An API token contains control characters.")
         self.opener = build_opener(NoRedirect())
 
-    def request(self, path, data=None):
+    def request(self, path, data=None, *, expect_json=True):
         headers = {"Accept": "application/json", "Authorization": self.authorization}
         body = None
         if data is not None:
@@ -107,10 +116,12 @@ class API:
             body = json.dumps(data).encode()
         try:
             with self.opener.open(Request(self.url + path, body, headers), timeout=5) as response:
-                return json.load(response)
+                if expect_json:
+                    return json.load(response)
+                return None
         except HTTPError as response:
             response.close()
-            raise EventError(f"Service returned HTTP {response.code}.") from None
+            raise APIError(response.code) from None
 
     def pages(self, path, **query):
         for page in range(1, 10001):
@@ -149,6 +160,12 @@ class RunRequest:
     issue: str
     commit: str
 
+    def parameters(self):
+        return {
+            "FACTORY_RUN_ID": self.run_id, "FACTORY_REPO": self.repo,
+            "FACTORY_ISSUE": self.issue, "FACTORY_COMMIT": self.commit,
+        }
+
 
 class Orchestrator(Protocol):
     def submit(self, run: RunRequest) -> str: ...
@@ -174,10 +191,7 @@ class Woodpecker:
         pipeline = self.api.request(self.path, {
             "branch": CONTROL_BRANCH,
             "message": run.run_id,
-            "variables": {
-                "FACTORY_RUN_ID": run.run_id, "FACTORY_REPO": run.repo,
-                "FACTORY_ISSUE": run.issue, "FACTORY_COMMIT": run.commit,
-            },
+            "variables": run.parameters(),
         })
         return self.job(pipeline)
 
@@ -190,6 +204,64 @@ class Woodpecker:
         if len(jobs) > 1:
             raise EventError("More than one Woodpecker pipeline matches the logical run.")
         return jobs[0] if jobs else None
+
+
+class Dagu:
+    def __init__(self, config):
+        self.api = API(config, "Bearer ")
+        self.path = f"/api/v1/dags/{DAG_NAME}"
+
+    @staticmethod
+    def job(run_id):
+        return f"dagu:{DAG_NAME}:{run_id}"
+
+    def submit(self, run):
+        try:
+            result = self.api.request(f"{self.path}/enqueue", {
+                "dagRunId": run.run_id,
+                "params": json.dumps(run.parameters()),
+            })
+        except APIError as error:
+            if error.status == 500 and (job := self.find(run.run_id)) is not None:
+                return job
+            raise
+        if result["dagRunId"] != run.run_id:
+            raise EventError("Dagu returned an unexpected run ID.")
+        return self.job(run.run_id)
+
+    def details(self, run_id):
+        try:
+            details = self.api.request(f"{self.path}/dag-runs/{quote(run_id, safe='')}")["dagRun"]
+        except APIError as error:
+            if error.status == 404:
+                return None
+            raise
+        if details["dagRunId"] != run_id:
+            raise EventError("Dagu returned an unexpected run ID.")
+        return details
+
+    def find(self, run_id):
+        return self.job(run_id) if self.details(run_id) is not None else None
+
+    def cancel(self, run_id):
+        terminal = {"aborted", "failed", "partially_succeeded", "rejected", "succeeded"}
+        details = self.details(run_id)
+        if details is None or details["statusLabel"] in terminal:
+            return True
+        status = details["statusLabel"]
+        path = f"/api/v1/dag-runs/{DAG_NAME}/{quote(run_id, safe='')}"
+        try:
+            if status == "queued":
+                self.api.request(f"{path}/dequeue", expect_json=False)
+            elif status in {"running", "waiting"}:
+                self.api.request(f"{path}/stop", {}, expect_json=False)
+            elif status != "not_started":
+                raise EventError("Dagu returned an unexpected run status.")
+        except APIError as error:
+            if error.status not in {404, 409}:
+                raise
+        details = self.details(run_id)
+        return details is None or details["statusLabel"] in terminal
 
 
 @contextmanager
@@ -348,21 +420,57 @@ def webhook_server(settings, host, port):
     return ThreadingHTTPServer((host, port), Webhook)
 
 
-def dispatch(settings, retry_id=None):
+@contextmanager
+def dispatch_lock(settings):
     with (settings.state_dir / "dispatch.lock").open("a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
+        yield
+
+
+def finish_cancellation(settings, run_id):
+    if not settings.orchestrator.cancel(run_id):
+        raise EventError(f"Dagu cancellation remains pending for {run_id}.")
+    with ledger(settings) as db:
+        db.execute("UPDATE runs SET dispatch = 'cancelled' WHERE run_id = ?", (run_id,))
+
+
+def cancel(settings, run_id):
+    if not isinstance(settings.orchestrator, Dagu):
+        raise EventError("Use the Woodpecker pipeline controls to cancel a Woodpecker job.")
+    with dispatch_lock(settings):
+        with ledger(settings) as db:
+            check_baseline(settings, db)
+            row = db.execute("SELECT dispatch, job FROM runs WHERE run_id = ?", (run_id,)).fetchone()
+            if row is None:
+                raise EventError("Unknown logical run ID.")
+            job = row["job"]
+            if row["dispatch"] == "submitting":
+                job = settings.orchestrator.job(run_id)
+            db.execute("UPDATE runs SET dispatch = 'cancelling', job = ? WHERE run_id = ?",
+                       (job, run_id))
+        finish_cancellation(settings, run_id)
+
+
+def dispatch(settings, retry_id=None):
+    with dispatch_lock(settings):
         with ledger(settings) as db:
             check_baseline(settings, db)
             if retry_id is None:
                 candidates = db.execute(
-                    "SELECT * FROM runs WHERE dispatch != 'submitted' ORDER BY rowid"
+                    "SELECT * FROM runs WHERE dispatch NOT IN ('submitted', 'cancelled') ORDER BY rowid"
                 ).fetchall()
             else:
                 row = db.execute("SELECT * FROM runs WHERE run_id = ?", (retry_id,)).fetchone()
                 if row is None:
                     raise EventError("Unknown logical run ID.")
-                candidates = [] if row["dispatch"] == "submitted" else [row]
+                candidates = [row] if row["dispatch"] in {"queued", "submitting"} else []
         for row in candidates:
+            if row["dispatch"] == "cancelling":
+                try:
+                    finish_cancellation(settings, row["run_id"])
+                except UPSTREAM_ERRORS:
+                    print(f"Dagu cancellation remains pending for {row['run_id']}.", file=sys.stderr)
+                continue
             run = RunRequest(row["run_id"], row["repo"], row["issue"], row["commit_sha"])
             try:
                 job = None
@@ -396,6 +504,8 @@ def main():
     worker.add_argument("--once", action="store_true")
     retry = commands.add_parser("retry")
     retry.add_argument("--run-id", required=True)
+    cancellation = commands.add_parser("cancel")
+    cancellation.add_argument("--run-id", required=True)
     args = parser.parse_args()
     os.umask(0o077)
     try:
@@ -411,6 +521,8 @@ def main():
                 print(json.dumps([dict(row) for row in db.execute("SELECT * FROM runs ORDER BY rowid")]))
         elif args.command == "retry":
             dispatch(settings, retry_id=args.run_id)
+        elif args.command == "cancel":
+            cancel(settings, args.run_id)
         else:
             while True:
                 dispatch(settings)

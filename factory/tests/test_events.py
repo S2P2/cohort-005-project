@@ -64,17 +64,52 @@ class Services(BaseHTTPRequestHandler):
             self.send_json({"commit": {"id": self.server.commit}})
         elif url.path == "/api/repos/27/pipelines":
             self.send_json(self.server.pipelines[30 * (page - 1):30 * page])
+        elif url.path.startswith("/api/v1/dags/factory-trial/dag-runs/"):
+            run = self.server.dag_runs.get(url.path.split("/")[-1])
+            if run is None:
+                self.send_error(404)
+            else:
+                self.send_json({"dagRun": run})
+        elif url.path.startswith("/api/v1/dag-runs/factory-trial/") and url.path.endswith("/dequeue"):
+            run_id = url.path.split("/")[-2]
+            if self.server.dag_runs[run_id]["statusLabel"] != "queued":
+                self.send_error(409)
+                return
+            del self.server.dag_runs[run_id]
+            if not self.server.lose_response:
+                self.send_response(200)
+                self.end_headers()
         else:
             self.send_error(404)
 
     def do_POST(self):
-        if self.path != "/api/repos/27/pipelines":
+        if self.path.startswith("/api/v1/dag-runs/factory-trial/") and self.path.endswith("/stop"):
+            run = self.server.dag_runs[self.path.split("/")[-2]]
+            if run["statusLabel"] != "running":
+                self.send_error(409)
+                return
+            run["statusLabel"] = "aborted"
+            self.send_response(200)
+            self.end_headers()
+            return
+        if self.path not in {"/api/repos/27/pipelines", "/api/v1/dags/factory-trial/enqueue"}:
             self.send_error(404)
             return
         body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
         if self.server.reject_next_submission:
             self.server.reject_next_submission = False
             self.send_error(503)
+            return
+        if self.path.endswith("/enqueue"):
+            run_id = body["dagRunId"]
+            if run_id in self.server.dag_runs:
+                self.send_error(500)
+                return
+            self.server.dag_runs[run_id] = {
+                "dagRunId": run_id, "params": json.loads(body["params"]), "statusLabel": "queued",
+            }
+            if not self.server.lose_response:
+                self.send_json({"dagRunId": run_id})
             return
         pipeline = {
             "number": len(self.server.pipelines) + 1,
@@ -89,7 +124,9 @@ class Services(BaseHTTPRequestHandler):
             self.send_json(pipeline)
 
 
-class SignedEventsTest(unittest.TestCase):
+class SignedEventScenarios:
+    backend = "woodpecker"
+
     def setUp(self):
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
@@ -98,15 +135,16 @@ class SignedEventsTest(unittest.TestCase):
         self.services.issues = {}
         self.services.pending_labels = {}
         self.services.pipelines = []
+        self.services.dag_runs = {}
         self.services.commit = COMMIT
         self.services.lose_response = False
         self.services.reject_next_submission = False
-        service_url = self.enterContext(running(self.services))
+        self.service_url = self.enterContext(running(self.services))
         self.config = self.root / "events.json"
         trial = self.root / "trial.json"
         trial.write_text(json.dumps({"repositories": {REPO: {}}}))
         for filename, contents in (("hook", SECRET), ("forgejo", b"read-token"),
-                                   ("woodpecker", b"submit-token")):
+                                   (self.backend, b"submit-token")):
             path = self.root / filename
             path.touch(mode=0o600)
             path.write_bytes(contents)
@@ -116,18 +154,31 @@ class SignedEventsTest(unittest.TestCase):
             "label": "factory:run",
             "repositories": {REPO: "main"},
             "forgejo": {
-                "url": service_url, "token_file": str(self.root / "forgejo"),
+                "url": self.service_url, "token_file": str(self.root / "forgejo"),
                 "webhook_secret_file": str(self.root / "hook"),
             },
-            "woodpecker": {
-                "url": service_url, "token_file": str(self.root / "woodpecker"),
-                "repo_id": 27,
+            self.backend: {
+                "url": self.service_url, "token_file": str(self.root / self.backend),
+                **({"repo_id": 27} if self.backend == "woodpecker" else {}),
             },
         }))
 
+    def job(self, run_id):
+        if self.backend == "dagu":
+            return f"dagu:factory-trial:{run_id}"
+        return "woodpecker:factory-control/launcher:1"
+
+    def submitted_inputs(self):
+        if self.backend == "dagu":
+            return [run["params"] for run in self.services.dag_runs.values()]
+        return [pipeline["variables"] for pipeline in self.services.pipelines]
+
+    def invoke(self, *args):
+        return subprocess.run([sys.executable, str(CLI), "--config", str(self.config), *args],
+                              text=True, capture_output=True, timeout=10)
+
     def command(self, *args):
-        result = subprocess.run([sys.executable, str(CLI), "--config", str(self.config), *args],
-                                text=True, capture_output=True, timeout=5)
+        result = self.invoke(*args)
         self.assertEqual(result.returncode, 0, result.stderr)
         return result.stdout
 
@@ -179,17 +230,19 @@ class SignedEventsTest(unittest.TestCase):
         self.assertEqual(self.send(issue, "issues", "opened"), 202)
         self.services.commit = commit("Advanced while queued")
         self.command("dispatch", "--once")
-        pipeline, = self.services.pipelines
-        self.assertEqual(pipeline["branch"], "main")
+        variables, = self.submitted_inputs()
         recorded, = json.loads(self.command("status"))
         run_id = recorded["run_id"]
-        self.assertEqual(pipeline["variables"], {
+        self.assertEqual(variables, {
             "FACTORY_REPO": REPO, "FACTORY_ISSUE": f"{REPO}#4", "FACTORY_COMMIT": original,
             "FACTORY_RUN_ID": run_id,
         })
-        self.assertEqual(pipeline["message"], f"MANUAL: {run_id} @ main")
+        self.assertEqual(recorded["job"], self.job(run_id))
+        if self.backend == "woodpecker":
+            pipeline, = self.services.pipelines
+            self.assertEqual(pipeline["branch"], "main")
+            self.assertEqual(pipeline["message"], f"MANUAL: {run_id} @ main")
         config = configure_trial(self.root)
-        variables = pipeline["variables"]
         result = subprocess.run([
             sys.executable, str(LAUNCHER), "--config", str(config),
             "--run-id", variables["FACTORY_RUN_ID"], "--repo", variables["FACTORY_REPO"],
@@ -213,7 +266,7 @@ class SignedEventsTest(unittest.TestCase):
         self.seed_and_listen()
         self.assertEqual(self.send(seeded), 202)
         self.command("dispatch", "--once")
-        self.assertEqual(self.services.pipelines, [])
+        self.assertEqual(self.submitted_inputs(), [])
 
     def test_existing_issue_requires_an_observed_removal_before_reapplication(self):
         old_snapshot = self.issue(4)
@@ -238,8 +291,8 @@ class SignedEventsTest(unittest.TestCase):
         self.issue(4, "factory:run")
         self.assertEqual(self.send(old_snapshot), 202)
         self.command("dispatch", "--once")
-        self.assertEqual(len(self.services.pipelines), 2)
-        self.assertEqual(len({item["variables"]["FACTORY_RUN_ID"] for item in self.services.pipelines}), 2)
+        self.assertEqual(len(self.submitted_inputs()), 2)
+        self.assertEqual(len({inputs["FACTORY_RUN_ID"] for inputs in self.submitted_inputs()}), 2)
 
     def test_later_label_notification_can_observe_a_missed_application(self):
         self.issue(4)
@@ -270,7 +323,7 @@ class SignedEventsTest(unittest.TestCase):
         self.assertEqual(self.send(issue, "pull_request_label", "label_updated"), 422)
         self.assertEqual(json.loads(self.command("status")), [])
 
-    def test_worker_recovers_lost_submit_response_by_exact_run_marker(self):
+    def test_worker_recovers_lost_submit_response_by_stable_run_id(self):
         self.seed_and_listen()
         self.assertEqual(self.send(self.issue(4, "factory:run")), 202)
         self.services.lose_response = True
@@ -281,9 +334,9 @@ class SignedEventsTest(unittest.TestCase):
         self.command("dispatch", "--once")
         confirmed, = json.loads(self.command("status"))
         self.assertEqual(confirmed["dispatch"], "submitted")
-        self.assertEqual(confirmed["job"], "woodpecker:factory-control/launcher:1")
+        self.assertEqual(confirmed["job"], self.job(initial["run_id"]))
         self.assertEqual(confirmed["run_id"], initial["run_id"])
-        self.assertEqual(len(self.services.pipelines), 1)
+        self.assertEqual(len(self.submitted_inputs()), 1)
 
     def test_operator_retry_recovers_an_unaccepted_submission_under_the_same_run_id(self):
         self.seed_and_listen()
@@ -293,17 +346,16 @@ class SignedEventsTest(unittest.TestCase):
         initial, = json.loads(self.command("status"))
         self.assertEqual(initial["dispatch"], "submitting")
         self.command("dispatch", "--once")
-        self.assertEqual(self.services.pipelines, [])
+        self.assertEqual(self.submitted_inputs(), [])
         self.command("retry", "--run-id", initial["run_id"])
         self.command("retry", "--run-id", initial["run_id"])
         final, = json.loads(self.command("status"))
         self.assertEqual(final["run_id"], initial["run_id"])
-        self.assertEqual(final["job"], "woodpecker:factory-control/launcher:1")
-        pipeline, = self.services.pipelines
-        self.assertEqual(pipeline["variables"]["FACTORY_COMMIT"], COMMIT)
-        self.assertEqual(pipeline["variables"]["FACTORY_RUN_ID"], initial["run_id"])
+        self.assertEqual(final["job"], self.job(initial["run_id"]))
+        variables, = self.submitted_inputs()
+        self.assertEqual(variables["FACTORY_COMMIT"], COMMIT)
+        self.assertEqual(variables["FACTORY_RUN_ID"], initial["run_id"])
         config = configure_trial(self.root)
-        variables = pipeline["variables"]
         command = [
             sys.executable, str(LAUNCHER), "--config", str(config),
             "--run-id", variables["FACTORY_RUN_ID"], "--repo", variables["FACTORY_REPO"],
@@ -328,6 +380,64 @@ class SignedEventsTest(unittest.TestCase):
         self.assertFalse((self.root / "allocated").exists())
         self.assertFalse((self.root / "vm.json").exists())
         self.assertFalse((self.root / "key").exists())
+
+
+class WoodpeckerEventsTest(SignedEventScenarios, unittest.TestCase):
+    pass
+
+
+class DaguEventsTest(SignedEventScenarios, unittest.TestCase):
+    backend = "dagu"
+
+    def test_duplicate_enqueue_500_recovers_the_existing_job(self):
+        self.seed_and_listen()
+        self.assertEqual(self.send(self.issue(4, "factory:run")), 202)
+        initial, = json.loads(self.command("status"))
+        run_id = initial["run_id"]
+        payload = {"dagRunId": run_id, "params": json.dumps({
+            "FACTORY_RUN_ID": run_id, "FACTORY_REPO": REPO,
+            "FACTORY_ISSUE": f"{REPO}#4", "FACTORY_COMMIT": COMMIT,
+        })}
+        with urlopen(Request(self.service_url + "/api/v1/dags/factory-trial/enqueue",
+                             json.dumps(payload).encode()), timeout=5) as response:
+            self.assertEqual(response.status, 200)
+        self.command("dispatch", "--once")
+        final, = json.loads(self.command("status"))
+        self.assertEqual(final["dispatch"], "submitted")
+        self.assertEqual(final["job"], self.job(run_id))
+        self.assertEqual(len(self.submitted_inputs()), 1)
+
+    def test_queued_cancellation_survives_dequeue_removing_remote_history(self):
+        self.seed_and_listen()
+        self.assertEqual(self.send(self.issue(4, "factory:run")), 202)
+        self.command("dispatch", "--once")
+        initial, = json.loads(self.command("status"))
+        run_id = initial["run_id"]
+        self.assertEqual(self.services.dag_runs[run_id]["statusLabel"], "queued")
+        self.services.lose_response = True
+        self.assertNotEqual(self.invoke("cancel", "--run-id", run_id).returncode, 0)
+        pending, = json.loads(self.command("status"))
+        self.assertEqual(pending["dispatch"], "cancelling")
+        self.command("dispatch", "--once")
+        self.command("retry", "--run-id", run_id)
+        self.command("cancel", "--run-id", run_id)
+        final, = json.loads(self.command("status"))
+        self.assertNotIn(run_id, self.services.dag_runs)
+        self.assertEqual(final["dispatch"], "cancelled")
+        self.assertEqual(final["job"], initial["job"])
+
+    def test_running_cancellation_stops_the_dag_and_preserves_its_history(self):
+        self.seed_and_listen()
+        self.assertEqual(self.send(self.issue(4, "factory:run")), 202)
+        self.command("dispatch", "--once")
+        initial, = json.loads(self.command("status"))
+        run_id = initial["run_id"]
+        self.services.dag_runs[run_id]["statusLabel"] = "running"
+        self.command("cancel", "--run-id", run_id)
+        final, = json.loads(self.command("status"))
+        self.assertEqual(final["dispatch"], "cancelled")
+        self.assertEqual(final["job"], initial["job"])
+        self.assertEqual(self.services.dag_runs[run_id]["statusLabel"], "aborted")
 
 
 if __name__ == "__main__":

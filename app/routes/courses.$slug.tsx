@@ -338,6 +338,13 @@ const ratingSchema = z.object({
   rating: z.coerce.number().int().min(MIN_RATING).max(MAX_RATING),
 });
 
+/** Someone signed out is sent to sign up first and comes back to the purchase. */
+function purchaseLink(path: string, currentUserId: number | null) {
+  return currentUserId
+    ? path
+    : `/signup?redirectTo=${encodeURIComponent(path)}`;
+}
+
 export function meta({ loaderData }: Route.MetaArgs) {
   const title = loaderData?.course?.title ?? "Course";
   return [
@@ -492,16 +499,18 @@ export default function CourseDetail({ loaderData }: Route.ComponentProps) {
   });
   const totalDurationLabel = outline.durationLabel;
 
-  const teamPurchaseLink = currentUserId
-    ? `/courses/${course.slug}/purchase?mode=team`
-    : `/signup?redirectTo=${encodeURIComponent(`/courses/${course.slug}/purchase?mode=team`)}`;
+  const purchasePath = `/courses/${course.slug}/purchase`;
+  const purchaseLinks = {
+    self: purchaseLink(purchasePath, currentUserId),
+    team: purchaseLink(`${purchasePath}?mode=team`, currentUserId),
+  };
 
   const enrollButton = (
     <EnrollButton
-      course={{ slug: course.slug, price: course.price }}
+      fullPrice={course.price}
       pppPrice={pppPrice}
       tierLabel={tierInfo.label}
-      currentUserId={currentUserId}
+      purchaseLinks={purchaseLinks}
     />
   );
 
@@ -625,7 +634,7 @@ export default function CourseDetail({ loaderData }: Route.ComponentProps) {
                     countryLock,
                     progress,
                     nextLessonId,
-                    teamPurchaseLink,
+                    teamPurchaseLink: purchaseLinks.team,
                     userRating,
                     refundOffer,
                   }

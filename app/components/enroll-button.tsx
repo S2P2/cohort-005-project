@@ -10,28 +10,13 @@ import {
 import { formatPrice } from "~/lib/utils";
 
 type EnrollButtonProps = {
-  course: { slug: string; price: number };
+  fullPrice: number;
   /** What this Person pays, after any Purchasing-Power discount. */
   pppPrice: number;
   tierLabel: string;
-  currentUserId: number | null;
+  /** Where "Buy for Myself" and "Buy for Team" lead. */
+  purchaseLinks: { self: string; team: string };
 };
-
-function purchasePath(slug: string, team: boolean) {
-  return `/courses/${slug}/purchase${team ? "?mode=team" : ""}`;
-}
-
-/** Someone signed out is sent to sign up first and comes back to the purchase. */
-function purchaseLink(
-  slug: string,
-  currentUserId: number | null,
-  team: boolean
-) {
-  const path = purchasePath(slug, team);
-  return currentUserId
-    ? path
-    : `/signup?redirectTo=${encodeURIComponent(path)}`;
-}
 
 function PurchaseTabsList() {
   return (
@@ -79,17 +64,17 @@ function PriceDisplay({
 
 /** Buy the course for yourself or for a team. */
 export function EnrollButton({
-  course,
+  fullPrice,
   pppPrice,
   tierLabel,
-  currentUserId,
+  purchaseLinks,
 }: EnrollButtonProps) {
   const priceLabel = formatPrice(pppPrice);
   const price = {
-    fullPrice: course.price,
+    fullPrice,
     priceLabel,
     tierLabel,
-    discounted: pppPrice < course.price,
+    discounted: pppPrice < fullPrice,
   };
 
   return (
@@ -98,7 +83,7 @@ export function EnrollButton({
       <TabsContentNoShift>
         <TabsContent value="self" forceMount>
           <PriceDisplay {...price} />
-          <Link to={purchaseLink(course.slug, currentUserId, false)}>
+          <Link to={purchaseLinks.self}>
             <Button size="lg" className="w-full">
               Enroll Now — {priceLabel}
             </Button>
@@ -106,7 +91,7 @@ export function EnrollButton({
         </TabsContent>
         <TabsContent value="team" forceMount>
           <PriceDisplay {...price} />
-          <Link to={purchaseLink(course.slug, currentUserId, true)}>
+          <Link to={purchaseLinks.team}>
             <Button size="lg" variant="outline" className="w-full">
               Buy for Your Team
             </Button>

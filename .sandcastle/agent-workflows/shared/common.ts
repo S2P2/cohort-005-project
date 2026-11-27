@@ -30,7 +30,7 @@ export const writeJson = (filename: string, value: unknown): void => {
 // Sandcastle runs every agent with its permission checks skipped, so it can
 // use any tool.
 export const claudeAgent = () =>
-  sandcastle.pi("zai/glm-5.3-flash", {
+  sandcastle.pi("zai/glm-5.4", {
     env: {
       ZAI_API_KEY: required("ZAI_API_KEY"),
     },

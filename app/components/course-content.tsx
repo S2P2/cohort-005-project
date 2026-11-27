@@ -8,6 +8,7 @@ import {
   PlayCircle,
 } from "lucide-react";
 import { Button } from "~/components/ui/button";
+import { LessonProgressStatus } from "~/db/schema";
 import { cn } from "~/lib/utils";
 import {
   type CollapsedSections,
@@ -17,7 +18,6 @@ import {
 } from "~/modules/course-outline/expansion";
 import {
   type CourseOutline,
-  type LessonStatus,
   type OutlineLesson,
   type OutlineSection,
   outlineSummary,
@@ -289,15 +289,15 @@ function LessonIcon({
   status,
 }: {
   mode: LessonMode;
-  status: LessonStatus;
+  status: LessonProgressStatus;
 }) {
   if (mode === "edit") {
     return <Pencil className="size-4 text-muted-foreground" />;
   }
-  if (mode === "view" && status === "completed") {
+  if (mode === "view" && status === LessonProgressStatus.Completed) {
     return <CheckCircle2 className="size-4 text-green-500" />;
   }
-  if (mode === "view" && status === "in-progress") {
+  if (mode === "view" && status === LessonProgressStatus.InProgress) {
     return <PlayCircle className="size-4 text-blue-500" />;
   }
   return <Circle className="size-4 text-muted-foreground" />;

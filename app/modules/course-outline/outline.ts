@@ -1,16 +1,13 @@
 import { LessonProgressStatus } from "~/db/schema";
 import { formatDuration } from "~/lib/utils";
 
-/** How far a Student has got with a lesson, as the course page shows it. */
-export type LessonStatus = "not-started" | "in-progress" | "completed";
-
 export type OutlineLesson = {
   id: number;
   title: string;
   durationMinutes: number | null;
   /** Short, like "12m" or "1h 5m". Null when the duration is unknown. */
   durationLabel: string | null;
-  status: LessonStatus;
+  status: LessonProgressStatus;
 };
 
 export type OutlineSection = {
@@ -51,14 +48,15 @@ function durationLabel(minutes: number): string | null {
   return minutes > 0 ? formatDuration(minutes, true, false, false) : null;
 }
 
-function lessonStatus(recorded: string | undefined): LessonStatus {
+/** Anything the schema does not record as a status reads as not started. */
+function lessonStatus(recorded: string | undefined): LessonProgressStatus {
   switch (recorded) {
     case LessonProgressStatus.Completed:
-      return "completed";
+      return LessonProgressStatus.Completed;
     case LessonProgressStatus.InProgress:
-      return "in-progress";
+      return LessonProgressStatus.InProgress;
     default:
-      return "not-started";
+      return LessonProgressStatus.NotStarted;
   }
 }
 
@@ -82,7 +80,7 @@ function sumDuration(lessons: ReadonlyArray<OutlineLesson>): number {
 
 function countByStatus(
   lessons: ReadonlyArray<OutlineLesson>,
-  status: LessonStatus
+  status: LessonProgressStatus
 ): number {
   return lessons.filter((lesson) => lesson.status === status).length;
 }
@@ -107,7 +105,7 @@ export function buildCourseOutline({
       lessonCount: lessons.length,
       durationMinutes,
       durationLabel: durationLabel(durationMinutes),
-      completedCount: countByStatus(lessons, "completed"),
+      completedCount: countByStatus(lessons, LessonProgressStatus.Completed),
     };
   });
 
@@ -120,7 +118,7 @@ export function buildCourseOutline({
     lessonCount: lessons.length,
     durationMinutes,
     durationLabel: durationLabel(durationMinutes),
-    completedCount: countByStatus(lessons, "completed"),
+    completedCount: countByStatus(lessons, LessonProgressStatus.Completed),
   };
 }
 

@@ -101,11 +101,11 @@ describe("buildCourseOutline", () => {
     const lessons = outline.sections.flatMap((section) => [...section.lessons]);
 
     expect(lessons.map((lesson) => lesson.status)).toEqual([
-      "completed",
-      "in-progress",
-      "not-started",
-      "completed",
-      "not-started",
+      LessonProgressStatus.Completed,
+      LessonProgressStatus.InProgress,
+      LessonProgressStatus.NotStarted,
+      LessonProgressStatus.Completed,
+      LessonProgressStatus.NotStarted,
     ]);
   });
 
@@ -121,7 +121,9 @@ describe("buildCourseOutline", () => {
       lessonProgressMap: { 7: "something-else" },
     });
 
-    expect(outline.sections[0].lessons[0].status).toBe("not-started");
+    expect(outline.sections[0].lessons[0].status).toBe(
+      LessonProgressStatus.NotStarted
+    );
     expect(outline.completedCount).toBe(0);
   });
 

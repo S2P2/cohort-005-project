@@ -3,7 +3,7 @@ import {
   expansionToggleLabel,
   NO_COLLAPSED_SECTIONS,
   outlineExpansion,
-} from "../index";
+} from "../expansion";
 
 const SECTION_IDS = [11, 12, 13] as const;
 

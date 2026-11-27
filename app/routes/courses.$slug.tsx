@@ -4,7 +4,7 @@ import { toast } from "sonner";
 import { z } from "zod";
 import type { Route } from "./+types/courses.$slug";
 import { coursePermissions } from "~/modules/permissions/course-permissions.server";
-import { buildCourseOutline } from "~/modules/course-outline";
+import { buildCourseOutline } from "~/modules/course-outline/outline";
 import { db } from "~/db";
 import {
   courses,

@@ -5,7 +5,7 @@ import {
   outlineSummary,
   sectionSummary,
   type OutlineInput,
-} from "../index";
+} from "../outline";
 
 const FOUNDATIONS = 11;
 const COMPONENTS = 12;

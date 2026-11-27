@@ -14,13 +14,15 @@ import {
   expansionToggleLabel,
   NO_COLLAPSED_SECTIONS,
   outlineExpansion,
-  outlineSummary,
-  sectionSummary,
+} from "~/modules/course-outline/expansion";
+import {
   type CourseOutline,
   type LessonStatus,
   type OutlineLesson,
   type OutlineSection,
-} from "~/modules/course-outline";
+  outlineSummary,
+  sectionSummary,
+} from "~/modules/course-outline/outline";
 
 /** How a lesson row behaves: the Instructor edits it, a viewer opens it, and
  * everyone else only sees its title. */

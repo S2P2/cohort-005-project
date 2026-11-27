@@ -94,24 +94,6 @@ function getCourseWithDetails(id: number) {
   };
 }
 
-function getLessonCountForCourse(courseId: number) {
-  const courseModules = db
-    .select({ id: modules.id })
-    .from(modules)
-    .where(eq(modules.courseId, courseId))
-    .all();
-
-  if (courseModules.length === 0) return 0;
-
-  const count = db
-    .select({ count: sql<number>`count(*)` })
-    .from(lessons)
-    .where(or(...courseModules.map((m) => eq(lessons.moduleId, m.id))))
-    .get();
-
-  return count?.count ?? 0;
-}
-
 function getCourseLessonIds(courseId: number): number[] {
   const courseModules = db
     .select({ id: modules.id })
@@ -374,8 +356,6 @@ export async function loader({ params, request }: Route.LoaderArgs) {
     throw data("Course not found", { status: 404 });
   }
 
-  const lessonCount = getLessonCountForCourse(course.id);
-
   let progress = 0;
   const lessonProgressMap: Record<number, string> = {};
   let nextLessonId: number | null = null;
@@ -415,7 +395,6 @@ export async function loader({ params, request }: Route.LoaderArgs) {
   return {
     course: courseWithDetails,
     salesCopyHtml,
-    lessonCount,
     enrolled,
     canView,
     canTake,
@@ -462,7 +441,6 @@ export default function CourseDetail({ loaderData }: Route.ComponentProps) {
   const {
     course,
     salesCopyHtml,
-    lessonCount,
     enrolled,
     canView,
     canTake,
@@ -568,7 +546,7 @@ export default function CourseDetail({ loaderData }: Route.ComponentProps) {
           </span>
           <span className="flex items-center gap-1">
             <BookOpen className="size-4" />
-            {lessonCount} lessons
+            {outline.lessonCount} lessons
           </span>
           {totalDurationLabel && (
             <span className="flex items-center gap-1">
@@ -624,7 +602,7 @@ export default function CourseDetail({ loaderData }: Route.ComponentProps) {
               instructorBio: course.instructorBio,
               firstLessonId: course.modules[0]?.lessons[0]?.id ?? null,
             }}
-            lessonCount={lessonCount}
+            lessonCount={outline.lessonCount}
             totalDuration={outline.durationMinutes}
             isInstructor={isInstructor}
             enrollment={

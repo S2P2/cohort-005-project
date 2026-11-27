@@ -24,8 +24,8 @@ import {
   sectionSummary,
 } from "~/modules/course-outline/outline";
 
-/** How a lesson row behaves: the Instructor edits it, a viewer opens it, and
- * everyone else only sees its title. */
+/** How a lesson row behaves: the Instructor edits it, someone who can view
+ * the course opens it, and everyone else only sees its title. */
 type LessonMode = "edit" | "view" | "locked";
 
 type CourseRef = { id: number; slug: string };

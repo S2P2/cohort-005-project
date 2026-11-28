@@ -37,11 +37,14 @@ function ThemeToggle() {
 export function SiteHeader({ signedIn }: { signedIn: boolean }) {
   return (
     <header className="border-b border-border">
-      <div className="mx-auto flex h-16 max-w-6xl items-center justify-between gap-4 px-4 sm:px-6">
+      <div className="mx-auto flex min-h-16 max-w-6xl items-center justify-between gap-4 px-4 py-2 sm:px-6">
         <Link to="/" className="text-xl font-bold tracking-tight">
           Cadence
         </Link>
-        <nav className="flex items-center gap-3 sm:gap-6">
+        {/* Under 360px the nav cannot fit beside the brand, so it wraps
+            inside itself rather than running the Sign Up button off the
+            edge. From 360px it stays on one row. */}
+        <nav className="flex flex-wrap items-center justify-end gap-x-3 gap-y-1 min-[360px]:flex-nowrap sm:gap-6">
           <Link to="/courses" className={navLink}>
             Courses
           </Link>

@@ -135,7 +135,10 @@ export function CoursePreview({
   const [course, ...behind] = courses;
 
   return (
-    <div className="relative mx-auto w-full max-w-lg pr-6 sm:pr-10">
+    // `isolate` gives the glow a stacking context to sit at the back of.
+    // Without it, -z-10 drops it behind the page's own background, where
+    // it never paints.
+    <div className="relative isolate mx-auto w-full max-w-lg pr-6 sm:pr-10">
       <div
         aria-hidden
         className="absolute -inset-8 -z-10 rounded-full bg-primary/10 blur-3xl"

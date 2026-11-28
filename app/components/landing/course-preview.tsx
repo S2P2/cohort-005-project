@@ -1,6 +1,6 @@
 import { Clock, User } from "lucide-react";
 import { CourseImage } from "~/components/course-image";
-import { cn } from "~/lib/utils";
+import { cn, pluralize } from "~/lib/utils";
 import type { FeaturedCourse } from "~/modules/landing-page/index.server";
 
 /** How many modules the card lists before it folds the rest into "and N more". */
@@ -41,7 +41,7 @@ function StackedCover({
 }
 
 function lessonsLabel(count: number) {
-  return `${count} ${count === 1 ? "lesson" : "lessons"}`;
+  return `${count} ${pluralize(count, "lesson")}`;
 }
 
 function ModuleOutline({ modules }: { modules: FeaturedCourse["modules"] }) {
@@ -70,7 +70,7 @@ function ModuleOutline({ modules }: { modules: FeaturedCourse["modules"] }) {
       </ol>
       {rest > 0 && (
         <p className="pt-2 text-xs text-muted-foreground">
-          and {rest} more {rest === 1 ? "module" : "modules"}
+          and {rest} more {pluralize(rest, "module")}
         </p>
       )}
     </div>

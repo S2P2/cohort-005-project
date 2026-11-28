@@ -74,3 +74,8 @@ export function formatDuration(
   }
   return `${mStr}m`;
 }
+
+/** The noun to follow a count: "lesson" for 1, "lessons" for anything else. */
+export function pluralize(count: number, singular: string): string {
+  return count === 1 ? singular : `${singular}s`;
+}

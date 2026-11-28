@@ -1,4 +1,5 @@
 import { BookOpen, GraduationCap, ListChecks } from "lucide-react";
+import { pluralize } from "~/lib/utils";
 import type { LandingStats } from "~/modules/landing-page/index.server";
 
 function Stat({
@@ -18,7 +19,7 @@ function Stat({
       <div>
         <p className="text-3xl font-bold tracking-tight">{value}</p>
         <p className="text-sm text-muted-foreground">
-          {value === 1 ? label : `${label}s`}
+          {pluralize(value, label)}
         </p>
       </div>
     </div>

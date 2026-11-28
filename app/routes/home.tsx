@@ -63,7 +63,7 @@ export default function Home({ loaderData }: Route.ComponentProps) {
 
   return (
     <div className="min-h-screen bg-background">
-      <SiteHeader currentUser={currentUser} />
+      <SiteHeader signedIn={currentUser !== null} />
       <main>
         <LandingHero featuredCourses={featuredCourses} />
         <StatsBand stats={stats} />
@@ -71,7 +71,7 @@ export default function Home({ loaderData }: Route.ComponentProps) {
           <FeaturedCourses courses={featuredCourses} />
         )}
       </main>
-      <SiteFooter />
+      <SiteFooter signedIn={currentUser !== null} />
       <DevUI
         users={users}
         currentUser={currentUser}

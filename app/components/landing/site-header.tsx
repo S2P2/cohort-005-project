@@ -3,8 +3,6 @@ import { Link } from "react-router";
 import { Moon, Sun } from "lucide-react";
 import { Button } from "~/components/ui/button";
 
-type Person = { id: number; name: string; role: string };
-
 const navLink =
   "whitespace-nowrap text-sm font-medium text-muted-foreground transition-colors hover:text-foreground";
 
@@ -36,7 +34,7 @@ function ThemeToggle() {
   );
 }
 
-export function SiteHeader({ currentUser }: { currentUser: Person | null }) {
+export function SiteHeader({ signedIn }: { signedIn: boolean }) {
   return (
     <header className="border-b border-border">
       <div className="mx-auto flex h-16 max-w-6xl items-center justify-between gap-4 px-4 sm:px-6">
@@ -48,7 +46,7 @@ export function SiteHeader({ currentUser }: { currentUser: Person | null }) {
             Courses
           </Link>
           <ThemeToggle />
-          {currentUser ? (
+          {signedIn ? (
             <Button asChild size="sm">
               <Link to="/dashboard">Dashboard</Link>
             </Button>

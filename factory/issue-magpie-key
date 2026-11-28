@@ -1,0 +1,127 @@
+#!/usr/bin/python3 -I
+
+import argparse
+from datetime import datetime, timedelta, timezone
+import json
+import os
+from pathlib import Path
+import re
+import subprocess
+import sys
+
+
+KEY_ID = r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}"
+RUN_ID = r"[a-z0-9][a-z0-9-]{0,47}"
+
+
+class MagpieError(Exception):
+    pass
+
+
+class Magpie:
+    def __init__(self, config):
+        self.binary = config["binary"]
+        self.issuer = config["issuer_id"]
+        self.accounts = config.get("accounts", [])
+        self.env = dict(os.environ)
+        if "xdg_config_home" in config:
+            if not Path(config["xdg_config_home"]).is_absolute():
+                raise MagpieError
+            self.env["XDG_CONFIG_HOME"] = config["xdg_config_home"]
+        config_home = Path(self.env.get("XDG_CONFIG_HOME") or Path.home() / ".config")
+        self.key_store = config_home / "magpie" / "caller-keys.json"
+        if not Path(self.binary).is_absolute() or not re.fullmatch(KEY_ID, self.issuer):
+            raise MagpieError
+        if not isinstance(self.accounts, list) or not all(
+            re.fullmatch(r"[A-Za-z0-9_./@!-]+", account) for account in self.accounts
+        ):
+            raise MagpieError
+
+    def command(self, *args):
+        return subprocess.run(
+            [self.binary, "gateway-key", *args], env=self.env, stdin=subprocess.DEVNULL,
+            capture_output=True, timeout=3, check=False,
+        )
+
+    def revoke(self, key_id):
+        if not re.fullmatch(KEY_ID, key_id):
+            raise MagpieError
+        result = self.command("remove", key_id)
+        if result.returncode and result.stderr.strip() != b"magpie: Key not found":
+            raise MagpieError
+
+    def find(self, run_id):
+        if not re.fullmatch(RUN_ID, run_id):
+            raise MagpieError
+        keys = json.loads(self.key_store.read_text())
+        if not isinstance(keys, list) or not any(key["id"] == self.issuer for key in keys):
+            raise MagpieError
+        matches = [key["id"] for key in keys
+                   if key["name"] == run_id and key.get("issuer") == self.issuer]
+        if not all(re.fullmatch(KEY_ID, key_id) and key_id != self.issuer for key_id in matches):
+            raise MagpieError
+        return matches
+
+    def issue(self, run_id, model, ttl_seconds):
+        if (not re.fullmatch(RUN_ID, run_id)
+                or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_./:-]{0,127}", model)
+                or not 60 <= ttl_seconds <= 900 or ttl_seconds % 60):
+            raise MagpieError
+        argv = ["issue", "--ttl", f"{ttl_seconds // 60}m", "--name", run_id,
+                "--models", model, "--from", self.issuer, "--json"]
+        if self.accounts:
+            argv.extend(["--accounts", ",".join(self.accounts)])
+        deadline = datetime.now(timezone.utc) + timedelta(seconds=ttl_seconds + 5)
+        result = self.command(*argv)
+        if result.returncode:
+            raise MagpieError
+        issued = json.loads(result.stdout)
+        key_id = issued["id"]
+        if not re.fullmatch(KEY_ID, key_id) or key_id == self.issuer:
+            raise MagpieError
+        try:
+            expiry = datetime.fromisoformat(issued["expires"].replace("Z", "+00:00"))
+            if not (datetime.now(timezone.utc) < expiry <= deadline
+                    and issued["name"] == run_id and issued["issuer"] == self.issuer
+                    and issued["models"] == [model]
+                    and isinstance(issued["key"], str) and issued["key"]):
+                raise MagpieError
+            for setting, value in (("admin", "off"), ("issuer", "off"),
+                                   ("mcp", "none"), ("memory", "off")):
+                if self.command(setting, key_id, value).returncode:
+                    raise MagpieError
+            return {"id": key_id, "key": issued["key"]}
+        except (MagpieError, KeyError, ValueError, TypeError, OSError, subprocess.SubprocessError):
+            self.revoke(key_id)
+            raise MagpieError from None
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Manage scoped factory keys with the Magpie CLI.")
+    parser.add_argument("--config", type=Path, default=Path("/etc/factory/magpie.json"))
+    commands = parser.add_subparsers(dest="operation", required=True)
+    issue = commands.add_parser("issue")
+    issue.add_argument("run_id")
+    issue.add_argument("model")
+    issue.add_argument("ttl_seconds", type=int)
+    revoke = commands.add_parser("revoke")
+    revoke.add_argument("key_id")
+    find = commands.add_parser("find")
+    find.add_argument("run_id")
+    args = parser.parse_args()
+    try:
+        magpie = Magpie(json.loads(args.config.read_text()))
+        if args.operation == "issue":
+            print(json.dumps(magpie.issue(args.run_id, args.model, args.ttl_seconds)))
+        elif args.operation == "revoke":
+            magpie.revoke(args.key_id)
+        else:
+            print(json.dumps(magpie.find(args.run_id)))
+    except (MagpieError, KeyError, ValueError, TypeError, OSError, subprocess.SubprocessError):
+        print("Magpie key operation could not be verified.", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

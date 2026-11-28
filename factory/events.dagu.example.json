@@ -1,0 +1,17 @@
+{
+  "state_dir": "/var/lib/factory/events-dagu",
+  "trial_config": "/etc/factory/trial.json",
+  "label": "factory:run",
+  "repositories": {
+    "factory-trials/smoke": "main"
+  },
+  "forgejo": {
+    "url": "https://forgejo.factory.example",
+    "webhook_secret_file": "/etc/factory/secrets/forgejo-webhook",
+    "token_file": "/etc/factory/secrets/forgejo-read"
+  },
+  "dagu": {
+    "url": "https://dagu.factory.example",
+    "token_file": "/etc/factory/secrets/dagu-submit"
+  }
+}

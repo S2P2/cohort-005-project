@@ -1,0 +1,10 @@
+params:
+  - FACTORY_RUN_ID: ''
+  - FACTORY_REPO: ''
+  - FACTORY_ISSUE: ''
+  - FACTORY_COMMIT: ''
+  - FACTORY_STARTUP: unspecified
+
+steps:
+  - name: isolated-trial
+    run: exec /opt/factory/scheduler-entrypoint.py dagu

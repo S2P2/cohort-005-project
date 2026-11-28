@@ -1,0 +1,16 @@
+skip_clone: true
+
+labels:
+  backend: local
+  factory: trial
+
+when:
+  - event: manual
+    branch: main
+    evaluate: 'CI_REPO == "factory-control/launcher"'
+
+steps:
+  - name: isolated-trial
+    image: /bin/sh
+    commands:
+      - exec /opt/factory/scheduler-entrypoint.py woodpecker

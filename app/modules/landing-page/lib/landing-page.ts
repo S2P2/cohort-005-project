@@ -49,7 +49,7 @@ export type LandingStats = {
 };
 
 export type LandingPage = {
-  /** The newest published courses, newest first. At most three. */
+  /** The newest published courses, newest first. At most FEATURED_COURSE_LIMIT. */
   featuredCourses: ReadonlyArray<FeaturedCourse>;
   stats: LandingStats;
 };
@@ -109,6 +109,8 @@ function modulesByCourse(db: Db, courseIds: ReadonlyArray<number>) {
 }
 
 function publishedStats(db: Db): LandingStats {
+  // An aggregate with no GROUP BY returns exactly one row, over an empty
+  // table too, so the first row is the only row and needs no fallback.
   const catalogue = db
     .select({
       courseCount: count(),
@@ -116,7 +118,7 @@ function publishedStats(db: Db): LandingStats {
     })
     .from(courses)
     .where(eq(courses.status, CourseStatus.Published))
-    .get();
+    .all()[0];
 
   const curriculum = db
     .select({ lessonCount: count(lessons.id) })
@@ -124,12 +126,12 @@ function publishedStats(db: Db): LandingStats {
     .innerJoin(modules, eq(lessons.moduleId, modules.id))
     .innerJoin(courses, eq(modules.courseId, courses.id))
     .where(eq(courses.status, CourseStatus.Published))
-    .get();
+    .all()[0];
 
   return {
-    courseCount: catalogue?.courseCount ?? 0,
-    instructorCount: catalogue?.instructorCount ?? 0,
-    lessonCount: curriculum?.lessonCount ?? 0,
+    courseCount: catalogue.courseCount,
+    instructorCount: catalogue.instructorCount,
+    lessonCount: curriculum.lessonCount,
   };
 }
 
